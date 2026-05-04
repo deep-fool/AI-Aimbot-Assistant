@@ -1,0 +1,98 @@
+#include <Mouse.h>
+#include <math.h>
+
+const int CENTER_X = 1280;
+const int CENTER_Y = 800;
+
+// PD 参数保持原样或微调
+float Kp = 0.12;
+float Kd = 0.03;
+
+// --- 拟人化 & 惯性参数 ---
+float cur_vel_x = 0;       // 当前 X 轴速度
+float cur_vel_y = 0;       // 当前 Y 轴速度
+float friction = 0.1;      // 摩擦力/阻力 (0.1 - 0.9)，值越大惯性越强
+float acceleration = 0.45;  // 加速灵敏度 (0.1 - 1.0)，值越小 S 曲线启动越慢
+
+float jitter_intensity = 0.1;
+float random_offset = 0.2;
+int min_delay = 1;
+int max_delay = 3;
+
+int last_error_x = 0;
+int last_error_y = 0;
+unsigned long last_move_time = 0;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setTimeout(1);
+  Mouse.begin();
+  randomSeed(analogRead(0));  
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    int targetX = Serial.parseInt();
+    int targetY = Serial.parseInt();
+    int isfire = Serial.parseInt();
+
+    if (targetX < 100 || targetY < 100 || targetX > 3000 || targetY > 2000) return;
+
+    int error_x = targetX - CENTER_X;
+    int error_y = targetY - CENTER_Y;
+
+    // 自动开火处理
+    if (isfire == 1) {
+      Mouse.press(MOUSE_LEFT);
+      delay(2); // 模拟点击时长抖动
+      Mouse.release(MOUSE_LEFT);
+    }
+
+    // 死区判断
+    if (abs(error_x) <= 8 && abs(error_y) <= 8) {
+      cur_vel_x *= 0; // 进入死区速度快速衰减
+      cur_vel_y *= 0;
+      return;
+    }
+
+    // 1. 计算理想目标移动量 (PID逻辑)
+    float dist = sqrt(error_x * error_x + error_y * error_y);
+    float kp_scale = (dist > 400) ? 3.5 : (dist > 200 ? 1.8 : 0.9);
+    
+    float target_move_x = (error_x * Kp * kp_scale) + (error_x - last_error_x) * Kd;
+    float target_move_y = (error_y * Kp * kp_scale) + (error_y - last_error_y) * Kd;
+
+    last_error_x = error_x;
+    last_error_y = error_y;
+
+    // 2. --- 引入 S 曲线加速度与惯性 ---
+    cur_vel_x = (cur_vel_x * friction) + (target_move_x * acceleration);
+    cur_vel_y = (cur_vel_y * friction) + (target_move_y * acceleration);
+
+    // 3. 拟人化抖动
+    float jitter_x = (dist < 150) ? (random(-100, 101) / 100.0 * jitter_intensity) : 0;
+    float jitter_y = (dist < 150) ? (random(-100, 101) / 100.0 * jitter_intensity) : 0;
+
+    // 4. 最终移动合成
+    float final_x = cur_vel_x + jitter_x + (random(-100, 101) / 100.0 * random_offset);
+    float final_y = cur_vel_y + jitter_y + (random(-100, 101) / 100.0 * random_offset);
+
+    // 这里的精度补偿，防止低速时无法移动
+    if (abs(final_x) < 1.0 && abs(error_x) > 2) final_x = (error_x > 0 ? 1.1 : -1.1);
+    if (abs(final_y) < 1.0 && abs(error_y) > 2) final_y = (error_y > 0 ? 1.1 : -1.1);
+
+    // 限制单次最大步进（防止画面撕裂/瞬间瞬移）
+    int move_x = constrain((int)round(final_x), -127, 127);
+    int move_y = constrain((int)round(final_y), -127, 127);
+
+    // 5. 随机采样延迟
+    if (millis() - last_move_time > 7) {
+      delay(random(min_delay, max_delay + 1));
+      Mouse.move(move_x, move_y, 0);
+      last_move_time = millis();
+    }
+
+    // 消耗掉多余的串口字符
+    while (Serial.available() > 0 && isspace(Serial.peek())) Serial.read();
+  }
+}
