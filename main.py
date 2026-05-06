@@ -1,4 +1,4 @@
-##imgiz=320
+# -*- coding: utf-8 -*-
 import cv2
 import numpy as np
 import torch
@@ -14,6 +14,7 @@ from ultralytics import YOLO
 import mss
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import json
 
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES  # type: ignore[import-not-found]
@@ -24,9 +25,12 @@ except Exception:
     DND_FILES = None
     HAS_DND = False
 
+CONFIG_FILE = Path(__file__).resolve().parent / "last_run_config.json"
+
 
 def round_up_to_multiple(value: int, multiple: int = 32) -> int:
     value = max(1, int(value))
+    multiple = max(1, int(multiple))
     return max(multiple, ((value + multiple - 1) // multiple) * multiple)
 
 
@@ -61,12 +65,28 @@ class RuntimeConfig:
     class_ids: str = "0"
     use_gpu: bool = True
     a: int = 3
+    # 模型推理尺寸与自适应开关
+    imgsz: int = 320
+    imgsz_auto: bool = True
 
 
 class ConfigStore:
     def __init__(self):
         self._cfg = RuntimeConfig()
         self._lock = threading.RLock()
+        # 尝试从磁盘加载上次运行的配置
+        try:
+            if CONFIG_FILE.exists():
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for k, v in data.items():
+                    if hasattr(self._cfg, k):
+                        try:
+                            setattr(self._cfg, k, v)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
     def snapshot(self) -> RuntimeConfig:
         with self._lock:
@@ -77,6 +97,12 @@ class ConfigStore:
             for key, value in kwargs.items():
                 if hasattr(self._cfg, key):
                     setattr(self._cfg, key, value)
+        # 保存到磁盘，便于下次启动恢复
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._cfg.__dict__, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     def set_model_path(self, model_path: str):
         self.update(model_path=model_path)
@@ -106,7 +132,7 @@ class ModelManager:
             with self._lock:
                 self._model = None
                 self._path = ""
-                self._error = f"模型不存�?: {model_path}"
+                self._error = f"模型不存在: {model_path}"
             return None, self._error
 
         try:
@@ -120,7 +146,7 @@ class ModelManager:
             with self._lock:
                 self._model = None
                 self._path = ""
-                self._error = f"妯″瀷鍔犺浇澶辫�?: {exc}"
+                self._error = f"妯″瀷鍔犺浇澶辫触: {exc}"
             return None, self._error
 
 
@@ -195,13 +221,13 @@ class AimAssistApp:
                               foreground="#14a085")
         fps_label.pack(anchor="e", side="right", padx=10)
 
-        # 分隔�?
+        # 分隔线
         sep1 = ttk.Label(main, text="─" * 60, foreground="#444444")
         sep1.pack(anchor="w", pady=(0, 8))
 
         cfg = self.config.snapshot()
 
-        toggles = ttk.LabelFrame(main, text="开�?")
+        toggles = ttk.LabelFrame(main, text="开关")
         toggles.pack(fill="x", pady=6)
 
         self.enabled_var = tk.BooleanVar(value=cfg.enabled)
@@ -211,7 +237,7 @@ class AimAssistApp:
 
         for row, (label, var, key) in enumerate([
             ("启用", self.enabled_var, "enabled"),
-            ("右键开�?/按住生效", self.right_click_enable_var, "right_click_enable"),
+            ("右键开火/按住生效", self.right_click_enable_var, "right_click_enable"),
             ("自动扳机", self.auto_trigger_var, "auto_trigger"),
             ("调试显示", self.debug_var, "debug"),
         ]):
@@ -232,20 +258,27 @@ class AimAssistApp:
         self.baud_rate_var = tk.IntVar(value=cfg.baud_rate)
         self.class_ids_var = tk.StringVar(value=cfg.class_ids)
         self.model_path_var = tk.StringVar(value=cfg.model_path)
+        # imgsz 和自适应开关
+        self.imgsz_var = tk.IntVar(value=cfg.imgsz)
+        self.imgsz_auto_var = tk.BooleanVar(value=cfg.imgsz_auto)
 
         self._add_slider(params, "识别范围半径", self.capture_radius_var, 64, 900, 1, "capture_radius")
-        self._add_slider(params, "置信度阈�?", self.conf_var, 0.05, 0.95, 0.01, "conf_thres")
+        self._add_slider(params, "置信度阈值", self.conf_var, 0.05, 0.95, 0.01, "conf_thres")
         self._add_slider(params, "锁定距离", self.lock_dist_var, 5, 300, 1, "lock_dist")
         self._add_slider(params, "自动扳机距离", self.fire_dist_var, 0, 80, 1, "fire_dist")
         self._add_slider(params, "压枪补偿Y", self.recoil_var, -50, 50, 1, "recoil_y")
-        self._add_slider(params, "目标丢失阈�? a", self.a_var, 1, 100, 1, "a")
-        self._add_slider(params, "发送间�?(ms)", self.send_interval_var, 1, 50, 1, "send_interval_ms", scale_value=True)
+        self._add_slider(params, "目标丢失阈值 a", self.a_var, 1, 100, 1, "a")
+        self._add_slider(params, "发送间隔(ms)", self.send_interval_var, 1, 50, 1, "send_interval_ms", scale_value=True)
+        # 模型尺寸控制（32 的倍数）
+        self._add_slider(params, "模型尺寸 imgsz", self.imgsz_var, 32, 1280, 32, "imgsz")
+        cb_imgsz = ttk.Checkbutton(params, text="imgsz 自适应", variable=self.imgsz_auto_var, command=lambda: self._sync_bool("imgsz_auto", self.imgsz_auto_var))
+        cb_imgsz.pack(anchor="w", padx=12, pady=(4, 6))
 
-        serial_frame = ttk.LabelFrame(main, text="连接与识�?")
+        serial_frame = ttk.LabelFrame(main, text="连接与识别")
         serial_frame.pack(fill="x", pady=6)
 
         self._add_entry(serial_frame, "串口", self.serial_port_var, 0)
-        self._add_entry(serial_frame, "波特�?", self.baud_rate_var, 1)
+        self._add_entry(serial_frame, "波特率", self.baud_rate_var, 1)
         self._add_entry(serial_frame, "目标类别ID", self.class_ids_var, 2)
 
         path_frame = ttk.LabelFrame(main, text="模型路径")
@@ -258,7 +291,7 @@ class AimAssistApp:
 
         self.drop_hint = ttk.Label(
             path_frame,
-            text="把模型文件拖到下面这个区域，或点浏览选择\n支持 .engine / .pt / .onnx �? Ultralytics 支持的格�?",
+            text="把模型文件拖到下面这个区域，或点浏览选择\n支持 .engine / .pt / .onnx 等 Ultralytics 支持的格式",
             anchor="center",
             justify="center",
             padding=10,
@@ -268,7 +301,7 @@ class AimAssistApp:
             self.drop_hint.drop_target_register(DND_FILES)
             self.drop_hint.dnd_bind("<<Drop>>", self._on_drop_model)
 
-        self.model_status = ttk.Label(path_frame, text="未加载模�?", foreground="#666")
+        self.model_status = ttk.Label(path_frame, text="未加载模型", foreground="#666")
         self.model_status.pack(fill="x", padx=8, pady=(0, 8))
 
         # 底部状态栏
@@ -279,7 +312,7 @@ class AimAssistApp:
         bottom.pack(fill="x", side="bottom", pady=(6, 0))
         status_label = ttk.Label(bottom, textvariable=self.status_text, font=("Microsoft YaHei UI", 10))
         status_label.pack(side="left", expand=True, fill="x")
-        ttk.Button(bottom, text="�? 退�?", command=self.on_close, width=8).pack(side="right", padx=(4, 0))
+        ttk.Button(bottom, text="✕ 退出", command=self.on_close, width=8).pack(side="right", padx=(4, 0))
 
         self.model_path_var.trace_add("write", lambda *_: self._sync_string("model_path", self.model_path_var))
         self.serial_port_var.trace_add("write", lambda *_: self._sync_string("serial_port", self.serial_port_var))
@@ -294,6 +327,9 @@ class AimAssistApp:
         self.send_interval_var.trace_add("write", lambda *_: self._sync_float("send_interval",
                                                                               self.send_interval_var.get() / 1000.0,
                                                                               direct=True))
+        # imgsz 相关 trace
+        self.imgsz_var.trace_add("write", lambda *_: self._sync_int("imgsz", self.imgsz_var))
+        self.imgsz_auto_var.trace_add("write", lambda *_: self._sync_bool("imgsz_auto", self.imgsz_auto_var))
 
     def _add_slider(self, parent, label, var, frm, to, resolution, key, scale_value=False):
         row = ttk.Frame(parent)
@@ -332,6 +368,11 @@ class AimAssistApp:
             elif key == "a":
                 try:
                     self.config.update(a=max(1, int(value)))
+                except Exception:
+                    pass
+            elif key == "imgsz":
+                try:
+                    self.config.update(imgsz=round_up_to_multiple(int(value), 32))
                 except Exception:
                     pass
 
@@ -415,7 +456,7 @@ class AimAssistApp:
         try:
             self.ser = serial.Serial(cfg.serial_port, cfg.baud_rate, timeout=0, write_timeout=0)
             time.sleep(1.2)
-            self.status_text.set(f"串口已连�?: {cfg.serial_port}")
+            self.status_text.set(f"串口已连接: {cfg.serial_port}")
         except Exception as exc:
             self.ser = None
             self.status_text.set(f"串口打开失败: {exc}")
@@ -482,7 +523,7 @@ class AimAssistApp:
 
     def _parse_classes(self, class_text: str):
         values = []
-        for part in str(class_text).replace("�?", ",").split(","):
+        for part in str(class_text).replace("，", ",").split(","):
             part = part.strip()
             if not part:
                 continue
@@ -493,7 +534,7 @@ class AimAssistApp:
         return values or [0]
 
     def _update_fps(self, fps: float):
-        """从推理线程安全地更新 FPS 显示�?"""
+        """从推理线程安全地更新 FPS 显示。"""
         with self.fps_lock:
             self.current_fps = fps
         try:
@@ -510,7 +551,7 @@ class AimAssistApp:
         prev_frame_time = time.time()
         current_model_path = ""
         model = None
-        print("AI 核心启动，按 P 键退出程�?...")
+        print("AI 核心启动，按 P 键退出程序...")
 
         while not self.exit_event.is_set():
             if keyboard.is_pressed("p"):
@@ -531,17 +572,21 @@ class AimAssistApp:
                     time.sleep(0.2)
                     continue
                 with self.ui_state_lock:
-                    self.pending_model_status = (f"已加�?: {Path(current_model_path).name}", "#1a7f37")
+                    self.pending_model_status = (f"已加载: {Path(current_model_path).name}", "#1a7f37")
 
             if model is None or self.latest_frame is None:
                 time.sleep(0.01)
                 continue
 
             frame_crop = self.latest_frame
-            imgsz = get_default_inference_size(model)
+            # 根据配置决定 imgsz：自适应则使用模型建议尺寸，否则使用用户手动设置（向上取整到 32 的倍数）
+            if cfg.imgsz_auto:
+                imgsz = get_default_inference_size(model, fallback=cfg.imgsz)
+            else:
+                imgsz = round_up_to_multiple(max(32, int(cfg.imgsz)), 32)
             class_ids = self._parse_classes(cfg.class_ids)
 
-            # 统计 FPS（始终统计，不依�? debug 模式�?
+            # 统计 FPS（始终统计，不依赖 debug 模式）
             fps_counter += 1
             if time.time() - fps_start_time >= 1.0:
                 current_fps = fps_counter / (time.time() - fps_start_time)
@@ -589,13 +634,13 @@ class AimAssistApp:
                 center_dists = np.sum((targets - center) ** 2, axis=1)
                 nearest_idx = int(np.argmin(center_dists))
 
-                # 若存在上次目标，尝试保持锁定，只有在连续丢失超过 cfg.a 帧后才彻底放�?
+                # 若存在上次目标，尝试保持锁定，只有在连续丢失超过 cfg.a 帧后才彻底放弃
                 if self.last_target_abs is not None:
                     last_pos = np.array(self.last_target_abs)
                     last_dists = np.sum((targets - last_pos) ** 2, axis=1)
                     last_idx = int(np.argmin(last_dists))
                     if last_dists[last_idx] < cfg.lock_dist * cfg.lock_dist:
-                        # 仍然检测到上次目标，重置丢失计数，并优先使用上次目标（如果它离中心更近的情况下�?
+                        # 仍然检测到上次目标，重置丢失计数，并优先使用上次目标（如果它离中心更近的情况下）
                         self.last_missing_frames = 0
                         if last_dists[last_idx] < center_dists[nearest_idx] * 1.5:
                             final_target = tuple(targets[last_idx])
@@ -614,7 +659,7 @@ class AimAssistApp:
                     final_target = tuple(targets[nearest_idx])
                     final_target_is_detection = True
             else:
-                # 本帧无检测到任何目标：若有上次目标则按阈值决定是否继续保�?
+                # 本帧无检测到任何目标：若有上次目标则按阈值决定是否继续保持
                 if self.last_target_abs is not None:
                     self.last_missing_frames += 1
                     if self.last_missing_frames <= cfg.a:
@@ -673,8 +718,9 @@ class AimAssistApp:
         if pending is not None:
             text, color = pending
             self.model_status.config(text=text, foreground=color)
+        imgsz_status = "自适应" if cfg.imgsz_auto else str(cfg.imgsz)
         self.status_text.set(
-            f"范围半径 {cfg.capture_radius} | imgsz 自适应 | 模型: {Path(cfg.model_path).name if cfg.model_path else '未加�?'}"
+            f"范围半径 {cfg.capture_radius} | imgsz: {imgsz_status} | 模型: {Path(cfg.model_path).name if cfg.model_path else '未加载'}"
         )
         self.root.after(120, self._refresh_status)
 
