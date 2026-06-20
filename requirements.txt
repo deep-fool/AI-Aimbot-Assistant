@@ -1,9 +1,0 @@
-opencv-python
-numpy
-torch==1.10.0+cu113
-pyserial
-keyboard
-pynput
-ultralytics
-mss
-tkinter
