@@ -777,9 +777,17 @@ private:
                 strncpy_s(g_modelPath, tmp, 511);
         }
         ImGui::Spacing();
-        if (ImGui::Button("应用并重载##reload", { -1,30 })) {
-            // 交给主控线程：它会确定性全停→重载引擎→放行。
-            // 不在 UI 线程动 g_running，也不 sleep（避免卡 UI）。
+        // 模型路径状态提示
+        if (g_modelPath[0] == '\0') {
+            ImGui::TextColored(C(.9f, .3f, .3f, 1), "  未选择模型文件！");
+        } else if (GetFileAttributesA(g_modelPath) == INVALID_FILE_ATTRIBUTES) {
+            ImGui::TextColored(C(.9f, .5f, .2f, 1), "  模型文件不存在！");
+        } else {
+            ImGui::TextColored(C(0, .9f, .46f, 1), "  模型文件已就绪");
+        }
+        if (ImGui::Button("选择模型并开始##reload", { -1,30 })) {
+            // 交给主控线程：它会校验路径→确定性全停→重载引擎→放行。
+            // 路径为空或文件不存在时，主控线程会拒绝运行并记录错误。
             g_requestResume = true;
         }
         ImGui::EndChild(); ImGui::PopStyleColor();

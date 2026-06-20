@@ -17,52 +17,24 @@ struct ImageData {
 static bool test = true;
 static int  open_test = 1;
 static ScreenCapture              g_capture;
-// ═══════════════════════════════════════════════════════════════════
-//  线程同步模型（重写）
-//  ------------------------------------------------------------------
-//  目标：彻底消除"改截图区域卡死"。不再用 sleep 猜测线程是否停下，
-//        改为确定性握手。每次暂停 = 全部真正停止后才动任何尺寸/资源。
-//
-//  g_running   : 唯一的"应当工作"开关。true=工作, false=两个工作线程
-//                必须停在安全点(park)。
-//  g_requestQuit: 程序退出。
-//
-//  工作线程握手：
-//    g_capParked / g_dispParked  —— 工作线程在 g_running=false 时，
-//    确认"我已经停在安全点、不再触碰共享资源/旧尺寸帧"后置 true。
-//    主控线程 WaitAllParked() 会阻塞直到两者都为 true，才安全地改尺寸、
-//    reinit、重载引擎，然后再把 g_running=true 放行。
-//
-//  这样任意时刻只要 g_running=false 且两线程 parked，
-//  CaptureLoop 绝不会在 Capture()、DisplayLoop 绝不会在 Inference()/用帧，
-//  改尺寸与 DXGI reinit 100% 安全。
-// ═══════════════════════════════════════════════════════════════════
-static std::atomic<bool>          g_running{ false };   // 启动后由主控放行
+static std::atomic<bool>          g_running{ false }; 
 static std::atomic<bool>          g_requestQuit{ false };
 
-// 工作线程"已停在安全点"确认标志
 static std::atomic<bool>          g_capParked{ false };
 static std::atomic<bool>          g_dispParked{ false };
 
-// UI 请求：开始/继续运行（主控线程消费）
 static std::atomic<bool>          g_requestResume{ false };
-// UI 请求：暂停（主控线程消费，执行全停）
 static std::atomic<bool>          g_requestPause{ false };
-// UI 请求：应用截图区域变更（主控线程消费）
 std::atomic<bool>                 g_requestRegionApply{ false };
 
 static std::shared_ptr<ImageData> g_latestFrame{ nullptr };
 static std::mutex                 g_frameMutex;
 static std::atomic<double>        g_captureFPS{ 0.0 };
 
-// 截图半径（UI 直接改这个 int），改动后通过 g_requestRegionApply 通知主控线程
 static int                        g_captureRadius = 112;
 
-// ── 兼容旧 UI：保留 g_paused 作为"对外显示状态"。真正的控制在 g_running。
-//    UI 仍可读它来显示"已暂停"。主控线程负责维护它。
 std::atomic<bool>                 g_paused{ false };
 static const int MODEL_INPUT_SIZE = 224;
-// ★ 尺寸改为原子，避免多线程无锁读写产生撕裂的中间态
 static std::atomic<int>           g_capW{ g_captureRadius * 2 };
 static std::atomic<int>           g_capH{ g_captureRadius * 2 };
 static int  g_backend = 1;
@@ -104,9 +76,6 @@ static bool g_aimOnLeft = false;   // 左键触发自瞄
 static bool g_aimOnRight = true;    // 右键触发自瞄
 
 // ── 急停射击（改为"屏蔽按键"实现）─────────────────────────────
-// 条件：按下自瞄触发键 AND 有锁定目标。
-// 旧逻辑是反向注入按键(A->按D)；现改为直接屏蔽玩家按下的 WASD，
-// 让游戏收不到该方向键，从而实现急停。
 static bool g_counterStrafing = false;
 
 // ── 键盘屏蔽方式 ─────────────────────────────────────────────
@@ -308,7 +277,7 @@ static int model_way = 0;
 static int inference_engine_mode = 0;
 static bool open_findcolor = false;
 int  g_modelInputSize = 224;
-char g_modelPath[512] = "E:\\TensorRT-10.16.0.72\\bin\\model\\wa.engine";
+char g_modelPath[512];
 char g_kmIP[64] = "192.168.2.188";
 char g_kmPort[16] = "1000";
 char g_kmMAC[32] = "25ABDBB2";
@@ -802,6 +771,9 @@ int main()
     SetConsoleOutputCP(65001);
     SetConsoleCP(65001);
 
+    // 不再设定默认模型路径——用户必须在 UI 中选择模型后才能开始运行
+    g_modelPath[0] = '\0';
+
     int ret = kmNet_init(g_kmIP, g_kmPort, g_kmMAC);
     if (ret != 0) {
         printf("[KMBox] 连接失败(ret=%d)，降级 SendInput\n", ret);
@@ -820,7 +792,6 @@ int main()
     g_kbdMaskMode = g_kmConnected ? MASK_KMBOX : MASK_HOOK;
     PushLog(g_kmConnected ? "[屏蔽] 默认: KMBox屏蔽" : "[屏蔽] 默认: 系统Hook屏蔽");
 
-    std::string path(g_modelPath);
     SetMoveMethod(g_kmConnected ? 0 : 1);
 
     g_capW.store(g_captureRadius * 2, std::memory_order_release);
@@ -833,22 +804,9 @@ int main()
         PushLog(buf);
     }
 
-    try {
-        g_detector = std::make_unique<Detector>(
-            path, model_way,
-            static_cast<InferenceEngine>(inference_engine_mode));
-        g_detector->SetInputSize(g_modelInputSize);
-        char buf[128];
-        snprintf(buf, sizeof(buf), "[引擎] 加载成功 %dx%d", g_modelInputSize, g_modelInputSize);
-        PushLog(buf);
-    }
-    catch (const std::exception& e) {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "[引擎] 加载失败: %s", e.what());
-        PushLog(buf);
-        fprintf(stderr, "%s\n", buf);
-        return -1;
-    }
+    // 不在启动时自动加载模型——用户必须先在 UI 中选择模型路径，
+    // 然后点击"开始"才会加载并运行。避免模型路径无效时直接报错退出。
+    PushLog("[系统] 启动完成，请选择模型文件后点击[开始]");
 
     timeBeginPeriod(1);
     StartRawInput();
@@ -864,12 +822,10 @@ int main()
     g_capW.store(g_captureRadius * 2, std::memory_order_release);
     g_capH.store(g_captureRadius * 2, std::memory_order_release);
 
-    // ── 启动后自动放行一次，进入运行 ─────────────────────────────
-    // 让两线程从 parked→active；CaptureLoop 会在自己的线程内首次 Init DXGI。
-    g_capParked.store(true, std::memory_order_release);   // 让 Capture 进入"刚放行→初始化"分支
-    g_paused.store(false, std::memory_order_release);
-    g_running.store(true, std::memory_order_release);
-    PushLog("[系统] 运行中");
+    // ── 默认不自动运行，保持在暂停状态。用户选择模型后点击"开始"才会放行。
+    //    此时 g_running=false，两线程在 parked 安全点等待。
+    g_paused.store(true, std::memory_order_release);
+    PushLog("[系统] 就绪——请选择模型文件后点击[开始]");
 
     // ════════════════════════════════════════════════════════════════
     //  主控循环：所有"会改变共享资源/尺寸/引擎"的操作都遵循同一铁律——
@@ -917,9 +873,21 @@ int main()
             continue;
         }
 
-        // ── (C) 开始/继续请求：全停 → 重载引擎/KMBox → 放行 ──────────
+        // ── (C) 开始/继续请求：全停 → 校验模型 → 重载引擎/KMBox → 放行 ──
         if (g_requestResume.exchange(false)) {
-            PushLog("[系统] 收到开始/继续，重载配置…");
+            PushLog("[系统] 收到开始/继续，校验模型…");
+
+            // ★ 校验模型路径：未选择模型文件则拒绝运行，防止引擎加载失败导致崩溃
+            if (g_modelPath[0] == '\0') {
+                PushLog("[错误] 未选择模型文件！请先在[设备]页浏览选择模型，再点击开始");
+                continue;   // 保持暂停，不放行
+            }
+            if (GetFileAttributesA(g_modelPath) == INVALID_FILE_ATTRIBUTES) {
+                char buf[512];
+                snprintf(buf, sizeof(buf), "[错误] 模型文件不存在: %s", g_modelPath);
+                PushLog(buf);
+                continue;   // 保持暂停，不放行
+            }
 
             StopAndWaitParked();                  // ★ 确定性全停
             if (g_requestQuit.load()) break;
@@ -932,13 +900,15 @@ int main()
                     static_cast<InferenceEngine>(inference_engine_mode));
                 g_detector->SetInputSize(g_modelInputSize);
                 char buf[128];
-                snprintf(buf, sizeof(buf), "[引擎] 重载成功 %dx%d", g_modelInputSize, g_modelInputSize);
+                snprintf(buf, sizeof(buf), "[引擎] 加载成功 %dx%d", g_modelInputSize, g_modelInputSize);
                 PushLog(buf);
             }
             catch (const std::exception& e) {
                 char buf[256];
-                snprintf(buf, sizeof(buf), "[引擎] 重载失败: %s", e.what());
+                snprintf(buf, sizeof(buf), "[引擎] 加载失败: %s", e.what());
                 PushLog(buf);
+                // 加载失败：保持暂停，不放行，避免无引擎空跑
+                continue;
             }
 
             // 同步尺寸（CaptureLoop 放行后会据此重 Init DXGI）
