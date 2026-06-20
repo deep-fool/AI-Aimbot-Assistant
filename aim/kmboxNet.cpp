@@ -144,11 +144,32 @@ int kmNet_init(char* ip, char* port, char* mac)
 		exit(EXIT_FAILURE);
 	}
 
-	err = sendto(sockClientfd, (const char*)&tx, sizeof(cmd_head_t), 0, (struct sockaddr*)&addrSrv, sizeof(addrSrv));
-	Sleep(20);//第一次连接可能时间比较久
-	int clen = sizeof(addrSrv);
-	err = recvfrom(sockClientfd, (char*)&rx, 1024, 0, (struct sockaddr*)&addrSrv, &clen);
-	return NetRxReturnHandle(&rx, &tx);
+		err = sendto(sockClientfd, (const char*)&tx, sizeof(cmd_head_t), 0, (struct sockaddr*)&addrSrv, sizeof(addrSrv));
+		Sleep(20);//第一次连接可能时间比较久
+		int clen = sizeof(addrSrv);
+		err = recvfrom(sockClientfd, (char*)&rx, 1024, 0, (struct sockaddr*)&addrSrv, &clen);
+		// 连接阶段必须严格检查：recvfrom超时/失败说明盒子不在线
+		if (err == SOCKET_ERROR || err <= 0) {
+			closesocket(sockClientfd);
+			sockClientfd = -1;
+			ReleaseMutex(m_hMutex_lock);
+			return err_net_rx_timeout;
+		}
+		// 连接阶段也需要检查回码正确性（不能像移动指令那样忽略错误）
+		if (rx.head.cmd != tx.head.cmd) {
+			closesocket(sockClientfd);
+			sockClientfd = -1;
+			ReleaseMutex(m_hMutex_lock);
+			return err_net_cmd;
+		}
+		if (rx.head.indexpts != tx.head.indexpts) {
+			closesocket(sockClientfd);
+			sockClientfd = -1;
+			ReleaseMutex(m_hMutex_lock);
+			return err_net_pts;
+		}
+		ReleaseMutex(m_hMutex_lock);
+		return success;
 }
 
 /*

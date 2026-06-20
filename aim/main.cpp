@@ -103,23 +103,62 @@ static float CFG_AIM_OFFSET_PCT = -30.0f;
 static bool g_aimOnLeft = false;   // 左键触发自瞄
 static bool g_aimOnRight = true;    // 右键触发自瞄
 
-// ── 急停射击（反向按键实现）───────────────────────────────────
+// ── 急停射击（改为"屏蔽按键"实现）─────────────────────────────
 // 条件：按下自瞄触发键 AND 有锁定目标。
-// 逻辑：玩家按 A → 注入按 D 抵消；按 D → 注入按 A；W↔S 同理。
-// 注入后端可切换：关闭 / KMBox反向 / 系统反向。
+// 旧逻辑是反向注入按键(A->按D)；现改为直接屏蔽玩家按下的 WASD，
+// 让游戏收不到该方向键，从而实现急停。
 static bool g_counterStrafing = false;
 
-// ── 急停注入后端 ─────────────────────────────────────────────
-//   0=关闭  1=KMBox反向(kmNet_enc_keydown/up + HID码)  2=系统反向(SendInput 扫描码)
-enum CsBackend { CS_OFF = 0, CS_KMBOX = 1, CS_SYSTEM = 2 };
-static int g_csBackend = CS_SYSTEM;   // 启动时按 KMBox 是否连接覆盖（见 main）
+// ── 键盘屏蔽方式 ─────────────────────────────────────────────
+//   0=关闭  1=KMBox屏蔽(kmNet_mask_keyboard)  2=系统Hook屏蔽(WH_KEYBOARD_LL)
+enum KbdMaskMode { MASK_OFF = 0, MASK_KMBOX = 1, MASK_HOOK = 2 };
+static int g_kbdMaskMode = MASK_HOOK;   // 启动时按 KMBox 是否连接覆盖（见 main）
+
+// 当前"应被系统 Hook 吞掉"的按键集合（每个 VK 一个原子标志）。
+// CaptureLoop/DisplayLoop 设置它，低级钩子线程读取它。
+static std::atomic<bool> g_maskA{ false }, g_maskD{ false },
+g_maskW{ false }, g_maskS{ false };
 
 // ── KMBox 连接状态 ───────────────────────────────────────────
 bool g_kmConnected = false;
 
-// Windows VK -> USB HID 键盘 Usage ID（KMBox enc_keydown/keyup 用 HID 扫描码）
-//   只需 WASD。返回 0 表示无映射。
-static int VkToHid(WORD vk) {
+// ── 键盘发送：KMBox优先，失败降级SendInput ───────────────────
+static inline void KeyDown(WORD vk) {
+    if (g_kmConnected) { kmNet_enc_keydown((int)vk); return; }
+    INPUT in = {}; in.type = INPUT_KEYBOARD;
+    in.ki.wVk = vk; in.ki.dwFlags = 0;
+    SendInput(1, &in, sizeof(INPUT));
+}
+static inline void KeyUp(WORD vk) {
+    if (g_kmConnected) { kmNet_enc_keyup((int)vk); return; }
+    INPUT in = {}; in.type = INPUT_KEYBOARD;
+    in.ki.wVk = vk; in.ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(1, &in, sizeof(INPUT));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  键盘屏蔽（急停用）
+//  ------------------------------------------------------------------
+//  两种实现，由 g_kbdMaskMode 选择：
+//   - MASK_KMBOX: 调 kmNet_mask_keyboard / kmNet_unmask_keyboard（HID 扫描码）
+//   - MASK_HOOK : 设置 g_maskX 原子，由 WH_KEYBOARD_LL 钩子吞掉对应键
+//  统一入口 SetKeyMasked(vk,on)；上层逻辑不关心底层用哪种。
+// ═══════════════════════════════════════════════════════════════════
+
+// vk -> 系统 Hook 原子标志指针（仅 WASD）
+static std::atomic<bool>* HookFlagFor(WORD vk) {
+    switch (vk) {
+    case 'A': return &g_maskA;
+    case 'D': return &g_maskD;
+    case 'W': return &g_maskW;
+    case 'S': return &g_maskS;
+    default:  return nullptr;
+    }
+}
+
+// Windows VK -> USB HID 键盘 Usage ID（KMBox 固件用 HID 扫描码，不是 Windows VK）
+//   A=0x04 B=0x05 ... 这里只需 WASD。返回 0 表示无映射。
+static short VkToHid(WORD vk) {
     switch (vk) {
     case 'A': return 0x04;
     case 'D': return 0x07;
@@ -129,55 +168,91 @@ static int VkToHid(WORD vk) {
     }
 }
 
-// Windows VK -> PS/2 Set-1 硬件扫描码（SendInput 用 KEYEVENTF_SCANCODE）
-//   很多游戏走 DirectInput/RawInput 只认硬件扫描码，注入 VK 收不到，故用扫描码。
-static WORD VkToScan(WORD vk) {
-    switch (vk) {
-    case 'A': return 0x1E;
-    case 'D': return 0x20;
-    case 'W': return 0x11;
-    case 'S': return 0x1F;
-    default:  return (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+// 屏蔽/解除屏蔽一个按键。on=true 屏蔽，on=false 解除。
+static void SetKeyMasked(WORD vk, bool on) {
+    switch (g_kbdMaskMode) {
+    case MASK_KMBOX:
+        if (g_kmConnected) {
+            short hid = VkToHid(vk);
+            if (hid) {
+                if (on) kmNet_mask_keyboard(hid);
+                else    kmNet_unmask_keyboard(hid);
+            }
+        }
+        break;
+    case MASK_HOOK:
+        if (auto* f = HookFlagFor(vk)) f->store(on, std::memory_order_release);
+        break;
+    case MASK_OFF:
+    default:
+        break;
     }
 }
 
-// ── 急停专用注入：按当前后端发"按下/抬起" ─────────────────────
-//   CS_KMBOX : kmNet_enc_keydown/keyup(HID)
-//   CS_SYSTEM: SendInput + KEYEVENTF_SCANCODE(硬件扫描码)
-static void CsKeyDown(WORD vk) {
-    switch (g_csBackend) {
-    case CS_KMBOX:
-        if (g_kmConnected) { int h = VkToHid(vk); if (h) kmNet_enc_keydown(h); }
-        break;
-    case CS_SYSTEM: {
-        INPUT in = {}; in.type = INPUT_KEYBOARD;
-        in.ki.wScan = VkToScan(vk);
-        in.ki.dwFlags = KEYEVENTF_SCANCODE;
-        SendInput(1, &in, sizeof(INPUT));
-        break;
-    }
-    default: break;
-    }
-}
-static void CsKeyUp(WORD vk) {
-    switch (g_csBackend) {
-    case CS_KMBOX:
-        if (g_kmConnected) { int h = VkToHid(vk); if (h) kmNet_enc_keyup(h); }
-        break;
-    case CS_SYSTEM: {
-        INPUT in = {}; in.type = INPUT_KEYBOARD;
-        in.ki.wScan = VkToScan(vk);
-        in.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
-        SendInput(1, &in, sizeof(INPUT));
-        break;
-    }
-    default: break;
+// 把所有 WASD 的屏蔽一次性解除（停止/暂停/丢失目标/松开触发键时调用）。
+// 注意：KMBox 端无条件 unmask（即使当前模式不是 KMBox，也防止切模式后残留屏蔽）。
+static void ClearAllKeyMasks() {
+    // 系统 Hook 标志
+    g_maskA.store(false, std::memory_order_release);
+    g_maskD.store(false, std::memory_order_release);
+    g_maskW.store(false, std::memory_order_release);
+    g_maskS.store(false, std::memory_order_release);
+    // KMBox 端解除（HID 扫描码；防止从 KMBox 模式切走后仍被硬件屏蔽）
+    if (g_kmConnected) {
+        kmNet_unmask_keyboard(VkToHid('A'));
+        kmNet_unmask_keyboard(VkToHid('D'));
+        kmNet_unmask_keyboard(VkToHid('W'));
+        kmNet_unmask_keyboard(VkToHid('S'));
     }
 }
 
-// 供 UI 调用（非 static）：切换后端时由 DisplayLoop 自行释放注入键，
-// 这里仅作占位/兼容（无残留硬件状态需要清理）。
-void UIClearKeyMasks() {}
+// 供 UI 调用（非 static）：切换屏蔽方式时清掉所有残留屏蔽
+void UIClearKeyMasks() { ClearAllKeyMasks(); }
+
+// ── 低级键盘钩子（WH_KEYBOARD_LL）：按 g_maskX 吞键 ───────────────
+//   只有在 MASK_HOOK 模式且对应 g_maskX=true 时，才拦截(返回1)该按键，
+//   游戏/系统都收不到。其余一律放行。钩子运行在自己的消息线程。
+static HHOOK  g_llKbdHook = nullptr;
+static std::thread g_hookThread;
+static std::atomic<DWORD> g_hookThreadId{ 0 };
+
+static LRESULT CALLBACK LowLevelKbdProc(int code, WPARAM w, LPARAM l) {
+    if (code == HC_ACTION && g_kbdMaskMode == MASK_HOOK) {
+        auto* kb = (KBDLLHOOKSTRUCT*)l;
+        std::atomic<bool>* f = HookFlagFor((WORD)kb->vkCode);
+        if (f && f->load(std::memory_order_acquire)) {
+            // 不区分按下/抬起，全部吞掉：屏蔽期间该键对系统完全不可见
+            return 1;
+        }
+    }
+    return CallNextHookEx(nullptr, code, w, l);
+}
+
+static void StartKbdHook() {
+    g_hookThread = std::thread([]() {
+        g_hookThreadId.store(GetCurrentThreadId(), std::memory_order_release);
+        g_llKbdHook = SetWindowsHookExW(
+            WH_KEYBOARD_LL, LowLevelKbdProc, GetModuleHandleW(nullptr), 0);
+        if (!g_llKbdHook) {
+            PushLog("[屏蔽] 低级键盘钩子安装失败");
+        }
+        else {
+            PushLog("[屏蔽] 系统Hook已就绪");
+        }
+        MSG msg;
+        // 钩子必须有消息循环来分发 LL 回调
+        while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            TranslateMessage(&msg); DispatchMessageW(&msg);
+        }
+        if (g_llKbdHook) { UnhookWindowsHookEx(g_llKbdHook); g_llKbdHook = nullptr; }
+        });
+}
+
+static void StopKbdHook() {
+    DWORD tid = g_hookThreadId.load(std::memory_order_acquire);
+    if (tid) PostThreadMessageW(tid, WM_QUIT, 0, 0);
+    if (g_hookThread.joinable()) g_hookThread.join();
+}
 
 // ── Raw Input 后台键盘检测（GetAsyncKeyState在游戏有焦点时可能失效）──
 std::atomic<bool> g_rawA{ false }, g_rawD{ false }, g_rawW{ false }, g_rawS{ false };
@@ -390,16 +465,18 @@ void DisplayLoop()
     float     vx = 0.f, vy = 0.f;
     bool      velocityReady = false;
 
-    // ── 急停持键状态（记录我们当前注入按住了哪些键）──────────────
-    bool cs_holdD = false, cs_holdA = false;
-    bool cs_holdS = false, cs_holdW = false;
+    // ── 急停屏蔽状态（记录我们当前屏蔽了哪些键）────────────────
+    bool cs_maskD = false, cs_maskA = false;
+    bool cs_maskS = false, cs_maskW = false;
 
-    // 释放所有急停注入键的 lambda（停止/暂停/松键/丢失目标时调用）
+    // 解除所有急停屏蔽的 lambda（停止/暂停/松键/丢失目标时调用）
     auto csReleaseAll = [&]() {
-        if (cs_holdD) { CsKeyUp('D'); cs_holdD = false; }
-        if (cs_holdA) { CsKeyUp('A'); cs_holdA = false; }
-        if (cs_holdS) { CsKeyUp('S'); cs_holdS = false; }
-        if (cs_holdW) { CsKeyUp('W'); cs_holdW = false; }
+        if (cs_maskD) { SetKeyMasked('D', false); cs_maskD = false; }
+        if (cs_maskA) { SetKeyMasked('A', false); cs_maskA = false; }
+        if (cs_maskS) { SetKeyMasked('S', false); cs_maskS = false; }
+        if (cs_maskW) { SetKeyMasked('W', false); cs_maskW = false; }
+        // 兜底：无条件清掉底层所有屏蔽（防止切模式/异常残留）
+        ClearAllKeyMasks();
         };
 
     auto lastFrameTime = std::chrono::high_resolution_clock::now();
@@ -410,32 +487,9 @@ void DisplayLoop()
     auto  inferFpsTimer = std::chrono::high_resolution_clock::now();
 
     bool wasRunning = false;  // 上一帧是否在运行（用于检测恢复时机）
-    int  prevCsBackend = g_csBackend;  // 检测急停后端切换，安全释放旧后端注入键
-
-    // 用指定后端释放某键（不依赖全局 g_csBackend，避免与 UI 线程竞态）
-    auto csKeyUpVia = [&](int backend, WORD vk) {
-        if (backend == CS_KMBOX) {
-            if (g_kmConnected) { int h = VkToHid(vk); if (h) kmNet_enc_keyup(h); }
-        }
-        else if (backend == CS_SYSTEM) {
-            INPUT in = {}; in.type = INPUT_KEYBOARD;
-            in.ki.wScan = VkToScan(vk);
-            in.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
-            SendInput(1, &in, sizeof(INPUT));
-        }
-        };
 
     while (!g_requestQuit.load())
     {
-        // ── 急停后端切换：用"旧后端"释放仍按住的注入键，避免卡键 ──
-        int curCsBackend = g_csBackend;  // 本帧快照（UI 线程可能随时改）
-        if (curCsBackend != prevCsBackend) {
-            if (cs_holdD) { csKeyUpVia(prevCsBackend, 'D'); cs_holdD = false; }
-            if (cs_holdA) { csKeyUpVia(prevCsBackend, 'A'); cs_holdA = false; }
-            if (cs_holdS) { csKeyUpVia(prevCsBackend, 'S'); cs_holdS = false; }
-            if (cs_holdW) { csKeyUpVia(prevCsBackend, 'W'); cs_holdW = false; }
-            prevCsBackend = curCsBackend;
-        }
         // ── 未运行：停在安全点，宣告 parked，绝不用旧帧/不调用 Inference ──
         if (!g_running.load(std::memory_order_acquire)) {
             if (wasRunning) {
@@ -443,7 +497,7 @@ void DisplayLoop()
                 csReleaseAll();
                 hasLockedTarget = false; lostFrameCount = 0;
                 vx = vy = 0.f; velocityReady = false;
-                cs_holdD = cs_holdA = cs_holdS = cs_holdW = false;
+                cs_maskD = cs_maskA = cs_maskS = cs_maskW = false;
                 prevFrame.reset();   // ★ 丢弃旧尺寸帧引用，恢复后只认新帧
             }
             wasRunning = false;
@@ -643,38 +697,33 @@ void DisplayLoop()
                     if (_trigL) absoluteY += y_offset;
                     SendData(absoluteX, absoluteY, fireNow, 0, boxW);
 
-                    // ── 急停射击（反向按键实现）─────────────────
+                    // ── 急停射击（屏蔽按键实现）─────────────────
                     // 条件：按下自瞄触发键 AND 有锁定目标（已在此分支内）。
-                    // 玩家按 A → 注入按 D 抵消；按 D → 注入按 A；W↔S 同理。
-                    if (g_counterStrafing && g_csBackend != CS_OFF) {
-                        // ★ 排除自己注入的按键，防止反馈循环：
-                        //   cs_holdD=true 时我们注入了 D，不能把这个 D 算作玩家按的 D，
-                        //   否则：注入D → 检测到D → 以为玩家按D → 释放D → 再注入 → 震荡。
-                        bool _kA = (g_rawA.load() || (GetAsyncKeyState('A') & 0x8000) != 0) && !cs_holdA;
-                        bool _kD = (g_rawD.load() || (GetAsyncKeyState('D') & 0x8000) != 0) && !cs_holdD;
-                        bool _kW = (g_rawW.load() || (GetAsyncKeyState('W') & 0x8000) != 0) && !cs_holdW;
-                        bool _kS = (g_rawS.load() || (GetAsyncKeyState('S') & 0x8000) != 0) && !cs_holdS;
+                    // 逻辑：把玩家当前按住的 WASD 直接屏蔽，让游戏收不到 →
+                    //       角色立即停止该方向移动（急停）。
+                    if (g_counterStrafing && g_kbdMaskMode != MASK_OFF) {
+                        // ★ 反馈震荡防护（关键）：
+                        //   系统Hook模式下，一旦屏蔽某键，LL钩子会吞掉它，
+                        //   连我们自己的 Raw Input / GetAsyncKeyState 也读不到了，
+                        //   于是会误判"玩家松手"→解除→又检测到→再屏蔽，产生震荡。
+                        //   解决：已屏蔽的键采用"latch"——本次自瞄按住期间保持屏蔽，
+                        //   不再因读不到按键而解除；只有在自瞄键松开（else 分支）
+                        //   或丢失目标/暂停（csReleaseAll）时才统一解除。
+                        bool pA = (g_rawA.load() || (GetAsyncKeyState('A') & 0x8000) != 0);
+                        bool pD = (g_rawD.load() || (GetAsyncKeyState('D') & 0x8000) != 0);
+                        bool pW = (g_rawW.load() || (GetAsyncKeyState('W') & 0x8000) != 0);
+                        bool pS = (g_rawS.load() || (GetAsyncKeyState('S') & 0x8000) != 0);
 
-                        // A按住且D没按 → 持续按D
-                        bool wD = _kA && !_kD;
-                        if (wD && !cs_holdD) { CsKeyDown('D'); cs_holdD = true; PushLog("[急停] A→按D"); }
-                        if (!wD && cs_holdD) { CsKeyUp('D');   cs_holdD = false; }
-                        // D按住且A没按 → 持续按A
-                        bool wA = _kD && !_kA;
-                        if (wA && !cs_holdA) { CsKeyDown('A'); cs_holdA = true; PushLog("[急停] D→按A"); }
-                        if (!wA && cs_holdA) { CsKeyUp('A');   cs_holdA = false; }
-                        // W按住且S没按 → 持续按S
-                        bool wS = _kW && !_kS;
-                        if (wS && !cs_holdS) { CsKeyDown('S'); cs_holdS = true; }
-                        if (!wS && cs_holdS) { CsKeyUp('S');   cs_holdS = false; }
-                        // S按住且W没按 → 持续按W
-                        bool wW = _kS && !_kW;
-                        if (wW && !cs_holdW) { CsKeyDown('W'); cs_holdW = true; }
-                        if (!wW && cs_holdW) { CsKeyUp('W');   cs_holdW = false; }
+                        // 按下且尚未屏蔽 → 开始屏蔽并 latch
+                        if (pA && !cs_maskA) { SetKeyMasked('A', true); cs_maskA = true; PushLog("[急停] 屏蔽 A"); }
+                        if (pD && !cs_maskD) { SetKeyMasked('D', true); cs_maskD = true; PushLog("[急停] 屏蔽 D"); }
+                        if (pW && !cs_maskW) { SetKeyMasked('W', true); cs_maskW = true; PushLog("[急停] 屏蔽 W"); }
+                        if (pS && !cs_maskS) { SetKeyMasked('S', true); cs_maskS = true; PushLog("[急停] 屏蔽 S"); }
+                        // 已屏蔽的键保持 latch，不在此处解除（见上注释）
                     }
                 }
                 else {
-                    // 自瞄键松开：立即释放急停注入键
+                    // 自瞄键松开：立即释放急停键
                     csReleaseAll();
                 }
 
@@ -766,10 +815,10 @@ int main()
         PushLog("[KMBox] 连接成功");
     }
 
-    // ── 急停后端默认值：有 KMBox 连接默认 KMBox反向，否则系统反向。
+    // ── 键盘屏蔽默认值：有 KMBox 连接默认用 KMBox 屏蔽，否则用系统 Hook。
     //    仅在启动时设定一次；用户之后可在 UI 自由切换，不会被覆盖。
-    g_csBackend = g_kmConnected ? CS_KMBOX : CS_SYSTEM;
-    PushLog(g_kmConnected ? "[急停] 默认: KMBox反向" : "[急停] 默认: 系统反向");
+    g_kbdMaskMode = g_kmConnected ? MASK_KMBOX : MASK_HOOK;
+    PushLog(g_kmConnected ? "[屏蔽] 默认: KMBox屏蔽" : "[屏蔽] 默认: 系统Hook屏蔽");
 
     std::string path(g_modelPath);
     SetMoveMethod(g_kmConnected ? 0 : 1);
@@ -803,6 +852,7 @@ int main()
 
     timeBeginPeriod(1);
     StartRawInput();
+    StartKbdHook();          // 低级键盘钩子（系统Hook屏蔽用，常驻）
     ImGuiUI::Get().Start();
 
     // CaptureLoop 和 DisplayLoop 是常驻线程；g_running=false 时它们 park 在安全点。
@@ -925,7 +975,9 @@ int main()
     // ── 彻底退出：先全停，再 join ─────────────────────────────────
     g_running.store(false, std::memory_order_release);
     g_paused.store(true, std::memory_order_release);
+    ClearAllKeyMasks();      // 确保退出时不残留任何键盘屏蔽
     StopRawInput();
+    StopKbdHook();           // 卸载低级键盘钩子
     if (captureThread.joinable()) captureThread.join();
     if (displayThread.joinable()) displayThread.join();
     timeEndPeriod(1);

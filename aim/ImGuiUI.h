@@ -57,8 +57,8 @@ extern bool             open_findcolor;
 extern bool             g_aimOnLeft;
 extern bool             g_aimOnRight;
 extern bool             g_counterStrafing;
-extern int              g_csBackend;     // 0=关 1=KMBox反向 2=系统反向
-// UI 切换急停后端时调用（占位，定义在 main.cpp）
+extern int              g_kbdMaskMode;   // 0=关 1=KMBox屏蔽 2=系统Hook屏蔽
+// UI 切换屏蔽方式时调用，清掉所有残留屏蔽（定义在 main.cpp）
 extern void UIClearKeyMasks();
 extern bool             g_kmConnected;
 extern std::atomic<float> g_captureMs;
@@ -549,32 +549,31 @@ private:
         ImGui::Checkbox("启用急停射击##cs", &g_counterStrafing);
         ImGui::Spacing();
 
-        // ── 急停注入后端 ─────────────────────────────────────
+        // ── 键盘屏蔽方式 ─────────────────────────────────────
         ImGui::PushStyleColor(ImGuiCol_Text, C(.75f, .78f, .82f, 1));
-        ImGui::Text("反向后端"); ImGui::PopStyleColor();
+        ImGui::Text("屏蔽方式"); ImGui::PopStyleColor();
         ImGui::SameLine(110); ImGui::SetNextItemWidth(-1);
-        const char* csItems[] = { "关闭", "KMBox反向", "系统反向" };
-        int prevCs = g_csBackend;
-        if (ImGui::Combo("##csbackend", &g_csBackend, csItems, 3)) {
-            if (g_csBackend != prevCs) {
-                // 切换后端：清掉旧后端可能残留的注入键（由 DisplayLoop 在停/松键时释放，
-                // 这里调用占位接口保持一致）。
+        const char* maskItems[] = { "关闭", "KMBox屏蔽", "系统Hook屏蔽" };
+        int prevMode = g_kbdMaskMode;
+        if (ImGui::Combo("##maskmode", &g_kbdMaskMode, maskItems, 3)) {
+            if (g_kbdMaskMode != prevMode) {
+                // 切换方式：先清掉旧方式可能残留的屏蔽，避免卡键
                 UIClearKeyMasks();
             }
         }
         ImGui::Spacing();
 
-        // KMBox 后端但未连接时给出警告
-        if (g_csBackend == 1 && !g_kmConnected) {
+        // KMBox 模式但未连接时给出警告
+        if (g_kbdMaskMode == 1 && !g_kmConnected) {
             ImGui::TextColored(C(.9f, .5f, .2f, 1),
-                "  KMBox未连接，反向注入不会生效");
+                "  KMBox未连接，屏蔽不会生效");
         }
 
         ImGui::PushStyleColor(ImGuiCol_Text, C(.5f, .52f, .55f, 1));
         ImGui::SetWindowFontScale(.85f);
         ImGui::TextWrapped("条件：按下自瞄触发键 且 有锁定目标时，"
-            "玩家按 A→注入按 D，D→A，W→S，S→W 抵消移动实现急停。"
-            "松开自瞄键 / 目标丢失 / 暂停时自动释放，不会卡键。");
+            "直接屏蔽玩家按住的 WASD（游戏收不到该键）实现急停。"
+            "松开自瞄键 / 目标丢失 / 暂停时自动解除，不会卡键。");
         ImGui::SetWindowFontScale(1.f);
         ImGui::PopStyleColor();
         ImGui::EndChild(); ImGui::PopStyleColor();
@@ -595,16 +594,16 @@ private:
         Sep(); CT("提示");
         Small("瞄点偏移：-100=框底，0=中心，100=框顶");
         Small("Y偏移：左键触发时叠加到绝对Y坐标");
-        Sep(); CT("急停后端状态");
+        Sep(); CT("急停屏蔽状态");
         {
-            const char* mm = (g_csBackend == 1) ? "KMBox反向"
-                : (g_csBackend == 2) ? "系统反向" : "关闭";
-            bool ok = (g_csBackend == 0)
-                || (g_csBackend == 2)
-                || (g_csBackend == 1 && g_kmConnected);
+            const char* mm = (g_kbdMaskMode == 1) ? "KMBox屏蔽"
+                : (g_kbdMaskMode == 2) ? "系统Hook屏蔽" : "关闭";
+            bool ok = (g_kbdMaskMode == 0)
+                || (g_kbdMaskMode == 2)
+                || (g_kbdMaskMode == 1 && g_kmConnected);
             ImGui::TextColored(ok ? C(0, .9f, .46f, 1) : C(.9f, .5f, .2f, 1),
-                "反向后端: %s", mm);
-            if (g_csBackend == 1 && !g_kmConnected)
+                "屏蔽方式: %s", mm);
+            if (g_kbdMaskMode == 1 && !g_kmConnected)
                 ImGui::TextColored(C(.9f, .5f, .2f, 1), "  (KMBox未连接)");
         }
         ImGui::EndChild(); ImGui::PopStyleColor();
@@ -838,7 +837,7 @@ private:
         ImGui::Columns(2, "swc", false);
         ImGui::SetColumnWidth(0, col2);
 
-        static bool useKMBox = true;
+        bool useKMBox = (g_moveMethod == MoveMethod::KMBOX);
         if (ImGui::Checkbox("KMBox 驱动", &useKMBox)) SetMoveMethod(useKMBox ? 0 : 1);
         Small("  关闭则使用 SendInput");
         ImGui::Spacing();
@@ -942,7 +941,7 @@ private:
         f << "vel_alpha=" << VELOCITY_ALPHA << "\nmax_vel=" << MAX_VELOCITY << "\nsame_sq=" << SAME_TARGET_DIST_SQ << "\n";
         f << "conf=" << conf << "\nauto_fire=" << g_autoFireEnabled << "\nfire_r=" << g_fireRadius << "\n";
         f << "aim_pct=" << CFG_AIM_OFFSET_PCT << "\ncap_r=" << g_captureRadius << "\n";
-        f << "cs_backend=" << g_csBackend << "\ncs=" << (g_counterStrafing ? 1 : 0) << "\n";
+        f << "kbd_mask=" << g_kbdMaskMode << "\ncs=" << (g_counterStrafing ? 1 : 0) << "\n";
         f << "findcolor=" << open_findcolor << "\n";
         f << "fc_h1lo=" << fc_h1lo << "\nfc_h1hi=" << fc_h1hi << "\n";
         f << "fc_s1lo=" << fc_s1lo << "\nfc_s1hi=" << fc_s1hi << "\n";
@@ -1010,7 +1009,7 @@ private:
                 else if (k == "fire_r")    g_fireRadius = std::stof(v);
                 else if (k == "aim_pct")   CFG_AIM_OFFSET_PCT = std::stof(v);
                 else if (k == "cap_r")     g_captureRadius = std::stoi(v);
-                else if (k == "cs_backend") g_csBackend = std::clamp(std::stoi(v), 0, 2);
+                else if (k == "kbd_mask")  g_kbdMaskMode = std::clamp(std::stoi(v), 0, 2);
                 else if (k == "cs")        g_counterStrafing = (v == "1" || v == "true");
                 else if (k == "findcolor") open_findcolor = v == "1" || v == "true";
                 else if (k == "fc_h1lo") fc_h1lo = std::stof(v);
