@@ -1,7 +1,0 @@
-enemy
-e_head
-teammate
-xiaobing
-daodi
-bachang
-bachangtou
