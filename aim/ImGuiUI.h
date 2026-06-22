@@ -37,6 +37,12 @@
 #include <commdlg.h>
 #pragma comment(lib,"comdlg32.lib")
 
+// ── kmboxNet 函数声明（避免重复包含 kmboxNet.h 导致 winsock/win 冲突）──
+int kmNet_init(char* ip, char* port, char* mac);
+int kmNet_monitor(short port);
+// ── main.cpp 日志函数 ──────────────────────────────────────────
+void PushLog(const std::string& s);
+
 // ── main.cpp 可调参数 extern ──────────────────────────────────
 extern int              y_offset;
 extern int              MAX_LOST_FRAMES;
@@ -53,12 +59,13 @@ extern std::atomic<bool> g_requestRegionApply;   // 改截图半径松手后触�
 extern int              open_test;
 extern int              model_way;
 extern int              inference_engine_mode;
+extern int              g_onnxDevice;       // 0=Auto 1=DirectML 2=CUDA 3=CPU
 extern bool             open_findcolor;
 extern bool             g_aimOnLeft;
 extern bool             g_aimOnRight;
 extern bool             g_counterStrafing;
-extern int              g_kbdMaskMode;   // 0=关 1=KMBox屏蔽 2=系统Hook屏蔽
-// UI 切换屏蔽方式时调用，清掉所有残留屏蔽（定义在 main.cpp）
+extern int              g_csBackend;     // 0=关 1=KMBox反向 2=系统反向
+// UI 切换急停后端时调用（占位，定义在 main.cpp）
 extern void UIClearKeyMasks();
 extern bool             g_kmConnected;
 extern std::atomic<float> g_captureMs;
@@ -80,6 +87,12 @@ extern float fc_h2lo, fc_h2hi, fc_s2lo, fc_s2hi, fc_v2lo, fc_v2hi;
 extern int   fc_roi_x, fc_roi_y, fc_roi_w, fc_roi_h;
 extern float fc_aim_scale;
 extern int   fc_min_area;
+extern int   g_fcRadius;       // 找色区域半径
+
+// ── 屏幕分辨率（定义在 main.cpp）─────────────────────────────
+extern int   g_screenW;        // 0=自动读取
+extern int   g_screenH;        // 0=自动读取
+extern bool  g_useManualRes;   // true=使用手动分辨率
 
 // ── 类别优先级列表（定义在 main.cpp）───────────────────────
 extern std::vector<int> g_categories;
@@ -549,31 +562,32 @@ private:
         ImGui::Checkbox("启用急停射击##cs", &g_counterStrafing);
         ImGui::Spacing();
 
-        // ── 键盘屏蔽方式 ─────────────────────────────────────
+        // ── 急停注入后端 ─────────────────────────────────────
         ImGui::PushStyleColor(ImGuiCol_Text, C(.75f, .78f, .82f, 1));
-        ImGui::Text("屏蔽方式"); ImGui::PopStyleColor();
+        ImGui::Text("反向后端"); ImGui::PopStyleColor();
         ImGui::SameLine(110); ImGui::SetNextItemWidth(-1);
-        const char* maskItems[] = { "关闭", "KMBox屏蔽", "系统Hook屏蔽" };
-        int prevMode = g_kbdMaskMode;
-        if (ImGui::Combo("##maskmode", &g_kbdMaskMode, maskItems, 3)) {
-            if (g_kbdMaskMode != prevMode) {
-                // 切换方式：先清掉旧方式可能残留的屏蔽，避免卡键
+        const char* csItems[] = { "关闭", "KMBox反向", "系统反向" };
+        int prevCs = g_csBackend;
+        if (ImGui::Combo("##csbackend", &g_csBackend, csItems, 3)) {
+            if (g_csBackend != prevCs) {
+                // 切换后端：清掉旧后端可能残留的注入键（由 DisplayLoop 在停/松键时释放，
+                // 这里调用占位接口保持一致）。
                 UIClearKeyMasks();
             }
         }
         ImGui::Spacing();
 
-        // KMBox 模式但未连接时给出警告
-        if (g_kbdMaskMode == 1 && !g_kmConnected) {
+        // KMBox 后端但未连接时给出警告
+        if (g_csBackend == 1 && !g_kmConnected) {
             ImGui::TextColored(C(.9f, .5f, .2f, 1),
-                "  KMBox未连接，屏蔽不会生效");
+                "  KMBox未连接，反向注入不会生效");
         }
 
         ImGui::PushStyleColor(ImGuiCol_Text, C(.5f, .52f, .55f, 1));
         ImGui::SetWindowFontScale(.85f);
         ImGui::TextWrapped("条件：按下自瞄触发键 且 有锁定目标时，"
-            "直接屏蔽玩家按住的 WASD（游戏收不到该键）实现急停。"
-            "松开自瞄键 / 目标丢失 / 暂停时自动解除，不会卡键。");
+            "玩家按 A→注入按 D，D→A，W→S，S→W 抵消移动实现急停。"
+            "松开自瞄键 / 目标丢失 / 暂停时自动释放，不会卡键。");
         ImGui::SetWindowFontScale(1.f);
         ImGui::PopStyleColor();
         ImGui::EndChild(); ImGui::PopStyleColor();
@@ -594,16 +608,16 @@ private:
         Sep(); CT("提示");
         Small("瞄点偏移：-100=框底，0=中心，100=框顶");
         Small("Y偏移：左键触发时叠加到绝对Y坐标");
-        Sep(); CT("急停屏蔽状态");
+        Sep(); CT("急停后端状态");
         {
-            const char* mm = (g_kbdMaskMode == 1) ? "KMBox屏蔽"
-                : (g_kbdMaskMode == 2) ? "系统Hook屏蔽" : "关闭";
-            bool ok = (g_kbdMaskMode == 0)
-                || (g_kbdMaskMode == 2)
-                || (g_kbdMaskMode == 1 && g_kmConnected);
+            const char* mm = (g_csBackend == 1) ? "KMBox反向"
+                : (g_csBackend == 2) ? "系统反向" : "关闭";
+            bool ok = (g_csBackend == 0)
+                || (g_csBackend == 2)
+                || (g_csBackend == 1 && g_kmConnected);
             ImGui::TextColored(ok ? C(0, .9f, .46f, 1) : C(.9f, .5f, .2f, 1),
-                "屏蔽方式: %s", mm);
-            if (g_kbdMaskMode == 1 && !g_kmConnected)
+                "反向后端: %s", mm);
+            if (g_csBackend == 1 && !g_kmConnected)
                 ImGui::TextColored(C(.9f, .5f, .2f, 1), "  (KMBox未连接)");
         }
         ImGui::EndChild(); ImGui::PopStyleColor();
@@ -699,11 +713,14 @@ private:
         // 右：截图/瞄准范围
         ImGui::PushStyleColor(ImGuiCol_ChildBg, C(.10f, .11f, .13f, 1));
         ImGui::BeginChild("##fc_r", { h,0 }, true);
-        CT("ROI 截图范围（相对截图中心）");
-        RowI("ROI X", &fc_roi_x, -400, 400, "%d px");
-        RowI("ROI Y", &fc_roi_y, -400, 400, "%d px");
-        RowI("ROI 宽", &fc_roi_w, 10, 500, "%d px");
-        RowI("ROI 高", &fc_roi_h, 10, 500, "%d px");
+        CT("找色区域（屏幕中心为基准）");
+        RowI("区域半径", &g_fcRadius, 10, 300, "%d px");
+        ImGui::PushStyleColor(ImGuiCol_Text, C(.5f, .52f, .55f, 1));
+        ImGui::SetWindowFontScale(.85f);
+        ImGui::Text("  -> 区域大小 %d x %d px（以屏幕中心为基准）",
+            g_fcRadius * 2, g_fcRadius * 2);
+        ImGui::SetWindowFontScale(1.f);
+        ImGui::PopStyleColor();
         Sep();
         CT("瞄准缩放");
         Row("aim_scale", &fc_aim_scale, .1f, 2.f, "%.2f");
@@ -744,7 +761,19 @@ private:
         LabelInput("UUID/MAC", g_kmMAC, 32);
         ImGui::Spacing();
         if (ImGui::Button("重新连接##kmconn", { -1,30 })) {
-            // kmNet_init(g_kmIP,g_kmPort,g_kmMAC); kmNet_monitor(1);
+            int r = kmNet_init(g_kmIP, g_kmPort, g_kmMAC);
+            if (r == 0) {
+                g_kmConnected = true;
+                kmNet_monitor(1);
+                SetMoveMethod(0);
+                PushLog("[KMBox] 手动重连成功");
+            } else {
+                g_kmConnected = false;
+                SetMoveMethod(1);
+                char buf[64];
+                snprintf(buf, sizeof(buf), "[KMBox] 手动重连失败(ret=%d)", r);
+                PushLog(buf);
+            }
         }
         ImGui::EndChild(); ImGui::PopStyleColor();
 
@@ -756,6 +785,10 @@ private:
         CT("推理引擎 & 模型");
         const char* engs[] = { "TensorRT (.engine)","ONNXRuntime (.onnx)" };
         LabelCombo("引擎类型", &inference_engine_mode, engs, 2);
+        if (inference_engine_mode == 1) {
+            const char* devs[] = { "Auto (DML>CUDA>CPU)","DirectML (N/A/I)","CUDA (NVIDIA)","CPU" };
+            LabelCombo("ONNX设备", &g_onnxDevice, devs, 4);
+        }
         const char* mdls[] = { "YOLOv10 [1,300,6]","YOLOv11 [1,4+nc,a]" };
         LabelCombo("模型版本", &model_way, mdls, 2);
         ImGui::Spacing();
@@ -777,17 +810,9 @@ private:
                 strncpy_s(g_modelPath, tmp, 511);
         }
         ImGui::Spacing();
-        // 模型路径状态提示
-        if (g_modelPath[0] == '\0') {
-            ImGui::TextColored(C(.9f, .3f, .3f, 1), "  未选择模型文件！");
-        } else if (GetFileAttributesA(g_modelPath) == INVALID_FILE_ATTRIBUTES) {
-            ImGui::TextColored(C(.9f, .5f, .2f, 1), "  模型文件不存在！");
-        } else {
-            ImGui::TextColored(C(0, .9f, .46f, 1), "  模型文件已就绪");
-        }
-        if (ImGui::Button("选择模型并开始##reload", { -1,30 })) {
-            // 交给主控线程：它会校验路径→确定性全停→重载引擎→放行。
-            // 路径为空或文件不存在时，主控线程会拒绝运行并记录错误。
+        if (ImGui::Button("应用并重载##reload", { -1,30 })) {
+            // 交给主控线程：它会确定性全停→重载引擎→放行。
+            // 不在 UI 线程动 g_running，也不 sleep（避免卡 UI）。
             g_requestResume = true;
         }
         ImGui::EndChild(); ImGui::PopStyleColor();
@@ -799,6 +824,27 @@ private:
         CT("模型输入分辨率");
         RowI("模型尺寸", &g_modelInputSize, 32, 1280, "%d px");
         Small("修改后需重载模型才能生效");
+        ImGui::EndChild(); ImGui::PopStyleColor();
+
+        // ── 屏幕分辨率覆盖 ──────────────────────────────────────
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, C(.10f, .11f, .13f, 1));
+        ImGui::BeginChild("##res", { 0,130 }, true);
+        CT("屏幕分辨率覆盖");
+        ImGui::Checkbox("使用手动分辨率##manualRes", &g_useManualRes);
+        if (!g_useManualRes) {
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+            ImGui::TextDisabled("当前自动: %d x %d",
+                GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+            ImGui::PopStyleVar();
+        }
+        else {
+            ImGui::TextColored(C(0, .9f, .46f, 1), "当前自动: %d x %d",
+                GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+            RowI("屏幕宽度", &g_screenW, 800, 7680, "%d px");
+            RowI("屏幕高度", &g_screenH, 600, 4320, "%d px");
+        }
+        Small("仅在系统自动检测错误时启用。影响截图和找色坐标计算。");
         ImGui::EndChild(); ImGui::PopStyleColor();
 
         // 类别 ID 优先级
@@ -846,7 +892,12 @@ private:
         ImGui::SetColumnWidth(0, col2);
 
         bool useKMBox = (g_moveMethod == MoveMethod::KMBOX);
-        if (ImGui::Checkbox("KMBox 驱动", &useKMBox)) SetMoveMethod(useKMBox ? 0 : 1);
+        if (ImGui::Checkbox("KMBox 驱动", &useKMBox)) {
+            SetMoveMethod(useKMBox ? 0 : 1);
+            if (useKMBox && !g_kmConnected) {
+                PushLog("[警告] KMBox未连接，移动指令不会生效");
+            }
+        }
         Small("  关闭则使用 SendInput");
         ImGui::Spacing();
         ImGui::Checkbox("自动开火", &g_autoFireEnabled);
@@ -923,9 +974,14 @@ private:
             ImGui::TextColored(C(0, .9f, .46f, 1), "%s", tb);
         }
         ImGui::Spacing();
-        ImGui::Text("找色：%s  HSV1=[%.0f-%.0f / %.0f-%.0f / %.0f-%.0f]",
+        ImGui::Text("找色：%s  半径=%dpx (%dx%d)  HSV1=[%.0f-%.0f / %.0f-%.0f / %.0f-%.0f]",
             open_findcolor ? "ON" : "OFF",
+            g_fcRadius, g_fcRadius * 2, g_fcRadius * 2,
             fc_h1lo, fc_h1hi, fc_s1lo, fc_s1hi, fc_v1lo, fc_v1hi);
+        ImGui::Text("分辨率：%s  %dx%d",
+            g_useManualRes ? "手动" : "自动",
+            g_useManualRes ? g_screenW : GetSystemMetrics(SM_CXSCREEN),
+            g_useManualRes ? g_screenH : GetSystemMetrics(SM_CYSCREEN));
 
         ImGui::EndChild(); ImGui::PopStyleColor();
     }
@@ -949,8 +1005,9 @@ private:
         f << "vel_alpha=" << VELOCITY_ALPHA << "\nmax_vel=" << MAX_VELOCITY << "\nsame_sq=" << SAME_TARGET_DIST_SQ << "\n";
         f << "conf=" << conf << "\nauto_fire=" << g_autoFireEnabled << "\nfire_r=" << g_fireRadius << "\n";
         f << "aim_pct=" << CFG_AIM_OFFSET_PCT << "\ncap_r=" << g_captureRadius << "\n";
-        f << "kbd_mask=" << g_kbdMaskMode << "\ncs=" << (g_counterStrafing ? 1 : 0) << "\n";
+        f << "cs_backend=" << g_csBackend << "\ncs=" << (g_counterStrafing ? 1 : 0) << "\n";
         f << "findcolor=" << open_findcolor << "\n";
+        f << "fc_radius=" << g_fcRadius << "\n";            // 找色区域半径（优先）
         f << "fc_h1lo=" << fc_h1lo << "\nfc_h1hi=" << fc_h1hi << "\n";
         f << "fc_s1lo=" << fc_s1lo << "\nfc_s1hi=" << fc_s1hi << "\n";
         f << "fc_v1lo=" << fc_v1lo << "\nfc_v1hi=" << fc_v1hi << "\n";
@@ -960,6 +1017,8 @@ private:
         f << "fc_roi_x=" << fc_roi_x << "\nfc_roi_y=" << fc_roi_y << "\n";
         f << "fc_roi_w=" << fc_roi_w << "\nfc_roi_h=" << fc_roi_h << "\n";
         f << "fc_aim_scale=" << fc_aim_scale << "\nfc_min_area=" << fc_min_area << "\n";
+        f << "screen_w=" << g_screenW << "\nscreen_h=" << g_screenH << "\n";
+        f << "manual_res=" << (g_useManualRes ? 1 : 0) << "\n";
         // 类别列表
         f << "categories=";
         for (int i = 0; i < (int)g_categories.size(); i++) {
@@ -1017,9 +1076,10 @@ private:
                 else if (k == "fire_r")    g_fireRadius = std::stof(v);
                 else if (k == "aim_pct")   CFG_AIM_OFFSET_PCT = std::stof(v);
                 else if (k == "cap_r")     g_captureRadius = std::stoi(v);
-                else if (k == "kbd_mask")  g_kbdMaskMode = std::clamp(std::stoi(v), 0, 2);
+                else if (k == "cs_backend") g_csBackend = std::clamp(std::stoi(v), 0, 2);
                 else if (k == "cs")        g_counterStrafing = (v == "1" || v == "true");
                 else if (k == "findcolor") open_findcolor = v == "1" || v == "true";
+                else if (k == "fc_radius")  g_fcRadius = std::stoi(v);
                 else if (k == "fc_h1lo") fc_h1lo = std::stof(v);
                 else if (k == "fc_h1hi") fc_h1hi = std::stof(v);
                 else if (k == "fc_s1lo") fc_s1lo = std::stof(v);
@@ -1038,6 +1098,9 @@ private:
                 else if (k == "fc_roi_h") fc_roi_h = std::stoi(v);
                 else if (k == "fc_aim_scale") fc_aim_scale = std::stof(v);
                 else if (k == "fc_min_area")  fc_min_area = std::stoi(v);
+                else if (k == "screen_w")   g_screenW = std::stoi(v);
+                else if (k == "screen_h")   g_screenH = std::stoi(v);
+                else if (k == "manual_res") g_useManualRes = (v == "1" || v == "true");
                 else if (k == "categories") {
                     g_categories.clear();
                     std::istringstream ss(v);

@@ -90,7 +90,7 @@ int NetRxReturnHandle(client_tx* rx, client_tx* tx)		 //接收的内容
 	if (rx->head.indexpts != tx->head.indexpts)
 		ret = err_net_pts;//时间戳错误
 	ReleaseMutex(m_hMutex_lock);
-	ret = 0;					//只要有回码就认为执行ok。规避数据包丢包风险。 网络不可达风险。数据包顺序不对风险。 键鼠本身无需太精确。如果网络环境不理想。不会导致整个系统报错。
+	// 仅连接初始化时需要严格返回错误码；运行时命令可容忍部分丢包
 	return ret;				//没有错误返回0
 }
 
@@ -144,32 +144,16 @@ int kmNet_init(char* ip, char* port, char* mac)
 		exit(EXIT_FAILURE);
 	}
 
-		err = sendto(sockClientfd, (const char*)&tx, sizeof(cmd_head_t), 0, (struct sockaddr*)&addrSrv, sizeof(addrSrv));
-		Sleep(20);//第一次连接可能时间比较久
-		int clen = sizeof(addrSrv);
-		err = recvfrom(sockClientfd, (char*)&rx, 1024, 0, (struct sockaddr*)&addrSrv, &clen);
-		// 连接阶段必须严格检查：recvfrom超时/失败说明盒子不在线
-		if (err == SOCKET_ERROR || err <= 0) {
-			closesocket(sockClientfd);
-			sockClientfd = -1;
-			ReleaseMutex(m_hMutex_lock);
-			return err_net_rx_timeout;
-		}
-		// 连接阶段也需要检查回码正确性（不能像移动指令那样忽略错误）
-		if (rx.head.cmd != tx.head.cmd) {
-			closesocket(sockClientfd);
-			sockClientfd = -1;
-			ReleaseMutex(m_hMutex_lock);
-			return err_net_cmd;
-		}
-		if (rx.head.indexpts != tx.head.indexpts) {
-			closesocket(sockClientfd);
-			sockClientfd = -1;
-			ReleaseMutex(m_hMutex_lock);
-			return err_net_pts;
-		}
+	err = sendto(sockClientfd, (const char*)&tx, sizeof(cmd_head_t), 0, (struct sockaddr*)&addrSrv, sizeof(addrSrv));
+	Sleep(20);//第一次连接可能时间比较久
+	int clen = sizeof(addrSrv);
+	err = recvfrom(sockClientfd, (char*)&rx, 1024, 0, (struct sockaddr*)&addrSrv, &clen);
+	if (err <= 0) {
+		// recvfrom 超时或失败：盒子未连接或网络不可达
 		ReleaseMutex(m_hMutex_lock);
-		return success;
+		return err_net_rx_timeout;
+	}
+	return NetRxReturnHandle(&rx, &tx);
 }
 
 /*

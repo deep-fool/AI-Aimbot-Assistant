@@ -15,26 +15,34 @@ struct ImageData {
 };
 
 static bool test = true;
-static int  open_test = 1;
+int  open_test = 1;
 static ScreenCapture              g_capture;
-static std::atomic<bool>          g_running{ false }; 
-static std::atomic<bool>          g_requestQuit{ false };
+std::atomic<bool>          g_running{ false };
+std::atomic<bool>          g_requestQuit{ false };
 
+// 工作线程"已停在安全点"确认标志
 static std::atomic<bool>          g_capParked{ false };
 static std::atomic<bool>          g_dispParked{ false };
 
-static std::atomic<bool>          g_requestResume{ false };
-static std::atomic<bool>          g_requestPause{ false };
+// UI 请求：开始/继续运行（主控线程消费）
+std::atomic<bool>          g_requestResume{ false };
+// UI 请求：暂停（主控线程消费，执行全停）
+std::atomic<bool>          g_requestPause{ false };
+// UI 请求：应用截图区域变更（主控线程消费）
 std::atomic<bool>                 g_requestRegionApply{ false };
 
 static std::shared_ptr<ImageData> g_latestFrame{ nullptr };
 static std::mutex                 g_frameMutex;
 static std::atomic<double>        g_captureFPS{ 0.0 };
 
-static int                        g_captureRadius = 112;
+// 截图半径（UI 直接改这个 int），改动后通过 g_requestRegionApply 通知主控线程
+int                        g_captureRadius = 112;
 
+// ── 兼容旧 UI：保留 g_paused 作为"对外显示状态"。真正的控制在 g_running。
+//    UI 仍可读它来显示"已暂停"。主控线程负责维护它。
 std::atomic<bool>                 g_paused{ false };
 static const int MODEL_INPUT_SIZE = 224;
+// ★ 尺寸改为原子，避免多线程无锁读写产生撕裂的中间态
 static std::atomic<int>           g_capW{ g_captureRadius * 2 };
 static std::atomic<int>           g_capH{ g_captureRadius * 2 };
 static int  g_backend = 1;
@@ -58,76 +66,40 @@ void PushLog(const std::string& s) {
 }
 
 // ── 自瞄参数 ────────────────────────────────────────────────
-static int   y_offset = 12;
-static int   MAX_LOST_FRAMES = 6;
-static float PREDICT_TIME = 0.007f;
-static float VELOCITY_ALPHA = 0.35f;
-static float MAX_VELOCITY = 800.0f;
-static std::vector<int> g_categories = { 0, 5 };
-static float conf = 0.25f;
-static float SAME_TARGET_DIST_SQ = 2500.0f;
-static bool  g_autoFireEnabled = true;
+int   y_offset = 12;
+int   MAX_LOST_FRAMES = 6;
+float PREDICT_TIME = 0.007f;
+float VELOCITY_ALPHA = 0.35f;
+float MAX_VELOCITY = 800.0f;
+std::vector<int> g_categories = { 0, 5 };
+float conf = 0.25f;
+float SAME_TARGET_DIST_SQ = 2500.0f;
+bool  g_autoFireEnabled = true;
 static bool  fireNow = false;
-static float g_fireRadius = 3.0f;
-static float CFG_AIM_OFFSET_PCT = -30.0f;
+float g_fireRadius = 3.0f;
+float CFG_AIM_OFFSET_PCT = -30.0f;
 
 // ── 自瞄触发键 ───────────────────────────────────────────────
-static bool g_aimOnLeft = false;   // 左键触发自瞄
-static bool g_aimOnRight = true;    // 右键触发自瞄
+bool g_aimOnLeft = false;   // 左键触发自瞄
+bool g_aimOnRight = true;    // 右键触发自瞄
 
-// ── 急停射击（改为"屏蔽按键"实现）─────────────────────────────
-static bool g_counterStrafing = false;
+// ── 急停射击（反向按键实现）───────────────────────────────────
+// 条件：按下自瞄触发键 AND 有锁定目标。
+// 逻辑：玩家按 A → 注入按 D 抵消；按 D → 注入按 A；W↔S 同理。
+// 注入后端可切换：关闭 / KMBox反向 / 系统反向。
+bool g_counterStrafing = false;
 
-// ── 键盘屏蔽方式 ─────────────────────────────────────────────
-//   0=关闭  1=KMBox屏蔽(kmNet_mask_keyboard)  2=系统Hook屏蔽(WH_KEYBOARD_LL)
-enum KbdMaskMode { MASK_OFF = 0, MASK_KMBOX = 1, MASK_HOOK = 2 };
-static int g_kbdMaskMode = MASK_HOOK;   // 启动时按 KMBox 是否连接覆盖（见 main）
-
-// 当前"应被系统 Hook 吞掉"的按键集合（每个 VK 一个原子标志）。
-// CaptureLoop/DisplayLoop 设置它，低级钩子线程读取它。
-static std::atomic<bool> g_maskA{ false }, g_maskD{ false },
-g_maskW{ false }, g_maskS{ false };
+// ── 急停注入后端 ─────────────────────────────────────────────
+//   0=关闭  1=KMBox反向(kmNet_enc_keydown/up + HID码)  2=系统反向(SendInput 扫描码)
+enum CsBackend { CS_OFF = 0, CS_KMBOX = 1, CS_SYSTEM = 2 };
+int g_csBackend = CS_SYSTEM;   // 启动时按 KMBox 是否连接覆盖（见 main）
 
 // ── KMBox 连接状态 ───────────────────────────────────────────
 bool g_kmConnected = false;
 
-// ── 键盘发送：KMBox优先，失败降级SendInput ───────────────────
-static inline void KeyDown(WORD vk) {
-    if (g_kmConnected) { kmNet_enc_keydown((int)vk); return; }
-    INPUT in = {}; in.type = INPUT_KEYBOARD;
-    in.ki.wVk = vk; in.ki.dwFlags = 0;
-    SendInput(1, &in, sizeof(INPUT));
-}
-static inline void KeyUp(WORD vk) {
-    if (g_kmConnected) { kmNet_enc_keyup((int)vk); return; }
-    INPUT in = {}; in.type = INPUT_KEYBOARD;
-    in.ki.wVk = vk; in.ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(1, &in, sizeof(INPUT));
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  键盘屏蔽（急停用）
-//  ------------------------------------------------------------------
-//  两种实现，由 g_kbdMaskMode 选择：
-//   - MASK_KMBOX: 调 kmNet_mask_keyboard / kmNet_unmask_keyboard（HID 扫描码）
-//   - MASK_HOOK : 设置 g_maskX 原子，由 WH_KEYBOARD_LL 钩子吞掉对应键
-//  统一入口 SetKeyMasked(vk,on)；上层逻辑不关心底层用哪种。
-// ═══════════════════════════════════════════════════════════════════
-
-// vk -> 系统 Hook 原子标志指针（仅 WASD）
-static std::atomic<bool>* HookFlagFor(WORD vk) {
-    switch (vk) {
-    case 'A': return &g_maskA;
-    case 'D': return &g_maskD;
-    case 'W': return &g_maskW;
-    case 'S': return &g_maskS;
-    default:  return nullptr;
-    }
-}
-
-// Windows VK -> USB HID 键盘 Usage ID（KMBox 固件用 HID 扫描码，不是 Windows VK）
-//   A=0x04 B=0x05 ... 这里只需 WASD。返回 0 表示无映射。
-static short VkToHid(WORD vk) {
+// Windows VK -> USB HID 键盘 Usage ID（KMBox enc_keydown/keyup 用 HID 扫描码）
+//   只需 WASD。返回 0 表示无映射。
+static int VkToHid(WORD vk) {
     switch (vk) {
     case 'A': return 0x04;
     case 'D': return 0x07;
@@ -137,91 +109,55 @@ static short VkToHid(WORD vk) {
     }
 }
 
-// 屏蔽/解除屏蔽一个按键。on=true 屏蔽，on=false 解除。
-static void SetKeyMasked(WORD vk, bool on) {
-    switch (g_kbdMaskMode) {
-    case MASK_KMBOX:
-        if (g_kmConnected) {
-            short hid = VkToHid(vk);
-            if (hid) {
-                if (on) kmNet_mask_keyboard(hid);
-                else    kmNet_unmask_keyboard(hid);
-            }
-        }
-        break;
-    case MASK_HOOK:
-        if (auto* f = HookFlagFor(vk)) f->store(on, std::memory_order_release);
-        break;
-    case MASK_OFF:
-    default:
-        break;
+// Windows VK -> PS/2 Set-1 硬件扫描码（SendInput 用 KEYEVENTF_SCANCODE）
+//   很多游戏走 DirectInput/RawInput 只认硬件扫描码，注入 VK 收不到，故用扫描码。
+static WORD VkToScan(WORD vk) {
+    switch (vk) {
+    case 'A': return 0x1E;
+    case 'D': return 0x20;
+    case 'W': return 0x11;
+    case 'S': return 0x1F;
+    default:  return (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
     }
 }
 
-// 把所有 WASD 的屏蔽一次性解除（停止/暂停/丢失目标/松开触发键时调用）。
-// 注意：KMBox 端无条件 unmask（即使当前模式不是 KMBox，也防止切模式后残留屏蔽）。
-static void ClearAllKeyMasks() {
-    // 系统 Hook 标志
-    g_maskA.store(false, std::memory_order_release);
-    g_maskD.store(false, std::memory_order_release);
-    g_maskW.store(false, std::memory_order_release);
-    g_maskS.store(false, std::memory_order_release);
-    // KMBox 端解除（HID 扫描码；防止从 KMBox 模式切走后仍被硬件屏蔽）
-    if (g_kmConnected) {
-        kmNet_unmask_keyboard(VkToHid('A'));
-        kmNet_unmask_keyboard(VkToHid('D'));
-        kmNet_unmask_keyboard(VkToHid('W'));
-        kmNet_unmask_keyboard(VkToHid('S'));
+// ── 急停专用注入：按当前后端发"按下/抬起" ─────────────────────
+//   CS_KMBOX : kmNet_enc_keydown/keyup(HID)
+//   CS_SYSTEM: SendInput + KEYEVENTF_SCANCODE(硬件扫描码)
+static void CsKeyDown(WORD vk) {
+    switch (g_csBackend) {
+    case CS_KMBOX:
+        if (g_kmConnected) { int h = VkToHid(vk); if (h) kmNet_enc_keydown(h); }
+        break;
+    case CS_SYSTEM: {
+        INPUT in = {}; in.type = INPUT_KEYBOARD;
+        in.ki.wScan = VkToScan(vk);
+        in.ki.dwFlags = KEYEVENTF_SCANCODE;
+        SendInput(1, &in, sizeof(INPUT));
+        break;
+    }
+    default: break;
+    }
+}
+static void CsKeyUp(WORD vk) {
+    switch (g_csBackend) {
+    case CS_KMBOX:
+        if (g_kmConnected) { int h = VkToHid(vk); if (h) kmNet_enc_keyup(h); }
+        break;
+    case CS_SYSTEM: {
+        INPUT in = {}; in.type = INPUT_KEYBOARD;
+        in.ki.wScan = VkToScan(vk);
+        in.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+        SendInput(1, &in, sizeof(INPUT));
+        break;
+    }
+    default: break;
     }
 }
 
-// 供 UI 调用（非 static）：切换屏蔽方式时清掉所有残留屏蔽
-void UIClearKeyMasks() { ClearAllKeyMasks(); }
-
-// ── 低级键盘钩子（WH_KEYBOARD_LL）：按 g_maskX 吞键 ───────────────
-//   只有在 MASK_HOOK 模式且对应 g_maskX=true 时，才拦截(返回1)该按键，
-//   游戏/系统都收不到。其余一律放行。钩子运行在自己的消息线程。
-static HHOOK  g_llKbdHook = nullptr;
-static std::thread g_hookThread;
-static std::atomic<DWORD> g_hookThreadId{ 0 };
-
-static LRESULT CALLBACK LowLevelKbdProc(int code, WPARAM w, LPARAM l) {
-    if (code == HC_ACTION && g_kbdMaskMode == MASK_HOOK) {
-        auto* kb = (KBDLLHOOKSTRUCT*)l;
-        std::atomic<bool>* f = HookFlagFor((WORD)kb->vkCode);
-        if (f && f->load(std::memory_order_acquire)) {
-            // 不区分按下/抬起，全部吞掉：屏蔽期间该键对系统完全不可见
-            return 1;
-        }
-    }
-    return CallNextHookEx(nullptr, code, w, l);
-}
-
-static void StartKbdHook() {
-    g_hookThread = std::thread([]() {
-        g_hookThreadId.store(GetCurrentThreadId(), std::memory_order_release);
-        g_llKbdHook = SetWindowsHookExW(
-            WH_KEYBOARD_LL, LowLevelKbdProc, GetModuleHandleW(nullptr), 0);
-        if (!g_llKbdHook) {
-            PushLog("[屏蔽] 低级键盘钩子安装失败");
-        }
-        else {
-            PushLog("[屏蔽] 系统Hook已就绪");
-        }
-        MSG msg;
-        // 钩子必须有消息循环来分发 LL 回调
-        while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-            TranslateMessage(&msg); DispatchMessageW(&msg);
-        }
-        if (g_llKbdHook) { UnhookWindowsHookEx(g_llKbdHook); g_llKbdHook = nullptr; }
-        });
-}
-
-static void StopKbdHook() {
-    DWORD tid = g_hookThreadId.load(std::memory_order_acquire);
-    if (tid) PostThreadMessageW(tid, WM_QUIT, 0, 0);
-    if (g_hookThread.joinable()) g_hookThread.join();
-}
+// 供 UI 调用（非 static）：切换后端时由 DisplayLoop 自行释放注入键，
+// 这里仅作占位/兼容（无残留硬件状态需要清理）。
+void UIClearKeyMasks() {}
 
 // ── Raw Input 后台键盘检测（GetAsyncKeyState在游戏有焦点时可能失效）──
 std::atomic<bool> g_rawA{ false }, g_rawD{ false }, g_rawW{ false }, g_rawS{ false };
@@ -273,19 +209,35 @@ static void StopRawInput() {
 }
 
 // ── 模型/引擎 ────────────────────────────────────────────────
-static int model_way = 0;
-static int inference_engine_mode = 0;
-static bool open_findcolor = false;
+int model_way = 0;
+int inference_engine_mode = 1;   // 0=TensorRT(.engine) 1=ONNXRuntime(.onnx) —— 默认 ONNX
+int  g_onnxDevice = 1;               // 0=Auto 1=DirectML(MDL) 2=CUDA 3=CPU —— 默认 DirectML(MDL)
+bool open_findcolor = false;
 int  g_modelInputSize = 224;
-char g_modelPath[512];
+char g_modelPath[512] = "";
 char g_kmIP[64] = "192.168.2.188";
 char g_kmPort[16] = "1000";
 char g_kmMAC[32] = "25ABDBB2";
 
+// ── 屏幕分辨率（0=自动读取系统分辨率，可手动覆盖）─────────────
+int   g_screenW = 0;          // 0=自动读取
+int   g_screenH = 0;          // 0=自动读取
+bool  g_useManualRes = false; // true=使用手动输入的分辨率
+
+int GetEffectiveScreenW() {
+    if (g_useManualRes && g_screenW > 0) return g_screenW;
+    return GetSystemMetrics(SM_CXSCREEN);
+}
+int GetEffectiveScreenH() {
+    if (g_useManualRes && g_screenH > 0) return g_screenH;
+    return GetSystemMetrics(SM_CYSCREEN);
+}
+
 // ── 找色参数 ─────────────────────────────────────────────────
 float fc_h1lo = 0, fc_h1hi = 3, fc_s1lo = 100, fc_s1hi = 255, fc_v1lo = 120, fc_v1hi = 255;
 float fc_h2lo = 177, fc_h2hi = 180, fc_s2lo = 100, fc_s2hi = 255, fc_v2lo = 100, fc_v2hi = 255;
-int   fc_roi_x = -80, fc_roi_y = -80, fc_roi_w = 160, fc_roi_h = 160;
+int   g_fcRadius = 40;        // 找色区域半径（默认40 → 屏幕中心80×80像素）
+int   fc_roi_x = -40, fc_roi_y = -40, fc_roi_w = 80, fc_roi_h = 80;
 float fc_aim_scale = 0.7f;
 int   fc_min_area = 2;
 
@@ -314,12 +266,17 @@ static void StopAndWaitParked()
 
 // CaptureLoop 内部：（重新）初始化截图后端到当前 g_capW/g_capH。
 // 只在 parked（全停）状态下被调用，所以读取尺寸 100% 安全、无撕裂。
-static void CaptureInitToCurrentSize()
+static bool CaptureInitToCurrentSize()
 {
     int w = g_capW.load(std::memory_order_acquire);
     int h = g_capH.load(std::memory_order_acquire);
-    int sw = GetSystemMetrics(SM_CXSCREEN);
-    int sh = GetSystemMetrics(SM_CYSCREEN);
+    // ★ 防御：尺寸非法直接失败，避免 Init/分配出现负数或 0
+    if (w <= 0 || h <= 0) {
+        PushLog("[截图] Init 失败(尺寸非法)");
+        return false;
+    }
+    int sw = GetEffectiveScreenW();
+    int sh = GetEffectiveScreenH();
     int tx = (sw - w) / 2, ty = (sh - h) / 2;
 
     g_capture.Reset();
@@ -328,7 +285,7 @@ static void CaptureInitToCurrentSize()
         g_backend = 0;
         if (!g_capture.Init(w, h, g_backend)) {
             PushLog("[截图] Init 失败(DXGI+GDI均失败)");
-            return;
+            return false;
         }
     }
     g_capture.SetRegion(tx, ty, w, h);
@@ -340,6 +297,7 @@ static void CaptureInitToCurrentSize()
     snprintf(buf, sizeof(buf), "[截图] 初始化 %dx%d 区域(%d,%d) 后端:%s",
         w, h, tx, ty, g_backendNames[g_backend]);
     PushLog(buf);
+    return true;
 }
 
 // ========================
@@ -365,10 +323,19 @@ void CaptureLoop()
         if (g_capParked.exchange(false, std::memory_order_acq_rel)) {
             // 此刻主控线程保证：g_running 已设 true 且尺寸已写好；
             // 我们在自己的线程里初始化（DXGI 要求同线程），完成后开始采集。
-            CaptureInitToCurrentSize();
-            inited = true;
+            // ★ 修复：初始化失败时绝不能置 inited=true，否则后续会对
+            //    未初始化/已 Reset 的 g_capture 调 Capture()，导致未定义行为。
+            inited = CaptureInitToCurrentSize();
             frameCount = 0;
             lastTime = std::chrono::high_resolution_clock::now();
+            if (!inited) {
+                // 初始化失败：回到暂停安全点，等待下一次放行重试，避免空转崩溃。
+                g_running.store(false, std::memory_order_release);
+                g_paused.store(true, std::memory_order_release);
+                g_capParked.store(true, std::memory_order_release);
+                PushLog("[截图] 初始化失败，已暂停采集");
+                continue;
+            }
         }
 
         if (!inited) {  // 理论上不会发生，保险起见
@@ -424,8 +391,8 @@ void DisplayLoop()
 
     // ★ 几何量不再用启动时的 const 快照——截图区域可在运行时改变。
     //   下列变量改为每帧根据当前 frame 尺寸重新计算（见循环内）。
-    int screenW = GetSystemMetrics(SM_CXSCREEN);
-    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    int screenW = GetEffectiveScreenW();
+    int screenH = GetEffectiveScreenH();
 
     bool      hasLockedTarget = false;
     int       lostFrameCount = 0;
@@ -434,18 +401,16 @@ void DisplayLoop()
     float     vx = 0.f, vy = 0.f;
     bool      velocityReady = false;
 
-    // ── 急停屏蔽状态（记录我们当前屏蔽了哪些键）────────────────
-    bool cs_maskD = false, cs_maskA = false;
-    bool cs_maskS = false, cs_maskW = false;
+    // ── 急停持键状态（记录我们当前注入按住了哪些键）──────────────
+    bool cs_holdD = false, cs_holdA = false;
+    bool cs_holdS = false, cs_holdW = false;
 
-    // 解除所有急停屏蔽的 lambda（停止/暂停/松键/丢失目标时调用）
+    // 释放所有急停注入键的 lambda（停止/暂停/松键/丢失目标时调用）
     auto csReleaseAll = [&]() {
-        if (cs_maskD) { SetKeyMasked('D', false); cs_maskD = false; }
-        if (cs_maskA) { SetKeyMasked('A', false); cs_maskA = false; }
-        if (cs_maskS) { SetKeyMasked('S', false); cs_maskS = false; }
-        if (cs_maskW) { SetKeyMasked('W', false); cs_maskW = false; }
-        // 兜底：无条件清掉底层所有屏蔽（防止切模式/异常残留）
-        ClearAllKeyMasks();
+        if (cs_holdD) { CsKeyUp('D'); cs_holdD = false; }
+        if (cs_holdA) { CsKeyUp('A'); cs_holdA = false; }
+        if (cs_holdS) { CsKeyUp('S'); cs_holdS = false; }
+        if (cs_holdW) { CsKeyUp('W'); cs_holdW = false; }
         };
 
     auto lastFrameTime = std::chrono::high_resolution_clock::now();
@@ -456,9 +421,32 @@ void DisplayLoop()
     auto  inferFpsTimer = std::chrono::high_resolution_clock::now();
 
     bool wasRunning = false;  // 上一帧是否在运行（用于检测恢复时机）
+    int  prevCsBackend = g_csBackend;  // 检测急停后端切换，安全释放旧后端注入键
+
+    // 用指定后端释放某键（不依赖全局 g_csBackend，避免与 UI 线程竞态）
+    auto csKeyUpVia = [&](int backend, WORD vk) {
+        if (backend == CS_KMBOX) {
+            if (g_kmConnected) { int h = VkToHid(vk); if (h) kmNet_enc_keyup(h); }
+        }
+        else if (backend == CS_SYSTEM) {
+            INPUT in = {}; in.type = INPUT_KEYBOARD;
+            in.ki.wScan = VkToScan(vk);
+            in.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+            SendInput(1, &in, sizeof(INPUT));
+        }
+        };
 
     while (!g_requestQuit.load())
     {
+        // ── 急停后端切换：用"旧后端"释放仍按住的注入键，避免卡键 ──
+        int curCsBackend = g_csBackend;  // 本帧快照（UI 线程可能随时改）
+        if (curCsBackend != prevCsBackend) {
+            if (cs_holdD) { csKeyUpVia(prevCsBackend, 'D'); cs_holdD = false; }
+            if (cs_holdA) { csKeyUpVia(prevCsBackend, 'A'); cs_holdA = false; }
+            if (cs_holdS) { csKeyUpVia(prevCsBackend, 'S'); cs_holdS = false; }
+            if (cs_holdW) { csKeyUpVia(prevCsBackend, 'W'); cs_holdW = false; }
+            prevCsBackend = curCsBackend;
+        }
         // ── 未运行：停在安全点，宣告 parked，绝不用旧帧/不调用 Inference ──
         if (!g_running.load(std::memory_order_acquire)) {
             if (wasRunning) {
@@ -466,7 +454,7 @@ void DisplayLoop()
                 csReleaseAll();
                 hasLockedTarget = false; lostFrameCount = 0;
                 vx = vy = 0.f; velocityReady = false;
-                cs_maskD = cs_maskA = cs_maskS = cs_maskW = false;
+                cs_holdD = cs_holdA = cs_holdS = cs_holdW = false;
                 prevFrame.reset();   // ★ 丢弃旧尺寸帧引用，恢复后只认新帧
             }
             wasRunning = false;
@@ -544,12 +532,22 @@ void DisplayLoop()
             }
 
             // ── 找色 ─────────────────────────────────────────
+            // 从半径同步 ROI 偏移量（保证 UI 只改 g_fcRadius 即可）
+            fc_roi_x = -g_fcRadius;
+            fc_roi_y = -g_fcRadius;
+            fc_roi_w = g_fcRadius * 2;
+            fc_roi_h = g_fcRadius * 2;
             if (open_findcolor) {
                 cv::Rect roi(screenCenterX + fc_roi_x, screenCenterY + fc_roi_y,
                     fc_roi_w, fc_roi_h);
                 roi &= cv::Rect(0, 0, frameMat.cols, frameMat.rows);
                 cv::Mat roiMat = frameMat(roi);
-                FindColor(roiMat);
+                FindColor(roiMat, (float)screenW, (float)screenH);
+                // ★ 红色矩形框出找色区域
+                cv::rectangle(display, roi, cv::Scalar(0, 0, 255), 1);
+                cv::putText(display, "FC_ROI",
+                    cv::Point(roi.x, std::max(roi.y - 4, 10)),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(0, 0, 255), 1);
             }
 
             // ── 优先级目标搜索 ───────────────────────────────
@@ -666,33 +664,38 @@ void DisplayLoop()
                     if (_trigL) absoluteY += y_offset;
                     SendData(absoluteX, absoluteY, fireNow, 0, boxW);
 
-                    // ── 急停射击（屏蔽按键实现）─────────────────
+                    // ── 急停射击（反向按键实现）─────────────────
                     // 条件：按下自瞄触发键 AND 有锁定目标（已在此分支内）。
-                    // 逻辑：把玩家当前按住的 WASD 直接屏蔽，让游戏收不到 →
-                    //       角色立即停止该方向移动（急停）。
-                    if (g_counterStrafing && g_kbdMaskMode != MASK_OFF) {
-                        // ★ 反馈震荡防护（关键）：
-                        //   系统Hook模式下，一旦屏蔽某键，LL钩子会吞掉它，
-                        //   连我们自己的 Raw Input / GetAsyncKeyState 也读不到了，
-                        //   于是会误判"玩家松手"→解除→又检测到→再屏蔽，产生震荡。
-                        //   解决：已屏蔽的键采用"latch"——本次自瞄按住期间保持屏蔽，
-                        //   不再因读不到按键而解除；只有在自瞄键松开（else 分支）
-                        //   或丢失目标/暂停（csReleaseAll）时才统一解除。
-                        bool pA = (g_rawA.load() || (GetAsyncKeyState('A') & 0x8000) != 0);
-                        bool pD = (g_rawD.load() || (GetAsyncKeyState('D') & 0x8000) != 0);
-                        bool pW = (g_rawW.load() || (GetAsyncKeyState('W') & 0x8000) != 0);
-                        bool pS = (g_rawS.load() || (GetAsyncKeyState('S') & 0x8000) != 0);
+                    // 玩家按 A → 注入按 D 抵消；按 D → 注入按 A；W↔S 同理。
+                    if (g_counterStrafing && g_csBackend != CS_OFF) {
+                        // ★ 排除自己注入的按键，防止反馈循环：
+                        //   cs_holdD=true 时我们注入了 D，不能把这个 D 算作玩家按的 D，
+                        //   否则：注入D → 检测到D → 以为玩家按D → 释放D → 再注入 → 震荡。
+                        bool _kA = (g_rawA.load() || (GetAsyncKeyState('A') & 0x8000) != 0) && !cs_holdA;
+                        bool _kD = (g_rawD.load() || (GetAsyncKeyState('D') & 0x8000) != 0) && !cs_holdD;
+                        bool _kW = (g_rawW.load() || (GetAsyncKeyState('W') & 0x8000) != 0) && !cs_holdW;
+                        bool _kS = (g_rawS.load() || (GetAsyncKeyState('S') & 0x8000) != 0) && !cs_holdS;
 
-                        // 按下且尚未屏蔽 → 开始屏蔽并 latch
-                        if (pA && !cs_maskA) { SetKeyMasked('A', true); cs_maskA = true; PushLog("[急停] 屏蔽 A"); }
-                        if (pD && !cs_maskD) { SetKeyMasked('D', true); cs_maskD = true; PushLog("[急停] 屏蔽 D"); }
-                        if (pW && !cs_maskW) { SetKeyMasked('W', true); cs_maskW = true; PushLog("[急停] 屏蔽 W"); }
-                        if (pS && !cs_maskS) { SetKeyMasked('S', true); cs_maskS = true; PushLog("[急停] 屏蔽 S"); }
-                        // 已屏蔽的键保持 latch，不在此处解除（见上注释）
+                        // A按住且D没按 → 持续按D
+                        bool wD = _kA && !_kD;
+                        if (wD && !cs_holdD) { CsKeyDown('D'); cs_holdD = true; PushLog("[急停] A→按D"); }
+                        if (!wD && cs_holdD) { CsKeyUp('D');   cs_holdD = false; }
+                        // D按住且A没按 → 持续按A
+                        bool wA = _kD && !_kA;
+                        if (wA && !cs_holdA) { CsKeyDown('A'); cs_holdA = true; PushLog("[急停] D→按A"); }
+                        if (!wA && cs_holdA) { CsKeyUp('A');   cs_holdA = false; }
+                        // W按住且S没按 → 持续按S
+                        bool wS = _kW && !_kS;
+                        if (wS && !cs_holdS) { CsKeyDown('S'); cs_holdS = true; }
+                        if (!wS && cs_holdS) { CsKeyUp('S');   cs_holdS = false; }
+                        // S按住且W没按 → 持续按W
+                        bool wW = _kS && !_kW;
+                        if (wW && !cs_holdW) { CsKeyDown('W'); cs_holdW = true; }
+                        if (!wW && cs_holdW) { CsKeyUp('W');   cs_holdW = false; }
                     }
                 }
                 else {
-                    // 自瞄键松开：立即释放急停键
+                    // 自瞄键松开：立即释放急停注入键
                     csReleaseAll();
                 }
 
@@ -738,8 +741,9 @@ void DisplayLoop()
         // ── FPS & 显示 ───────────────────────────────────────
         if (test) {
             auto  nowFps = std::chrono::high_resolution_clock::now();
-            float fps = 1000.f / std::chrono::duration<float, std::milli>(
+            float frameMs = std::chrono::duration<float, std::milli>(
                 nowFps - lastFpsTime).count();
+            float fps = (frameMs > 0.f) ? (1000.f / frameMs) : 0.f;  // ★ 防除零/inf
             lastFpsTime = nowFps;
             cv::putText(display, "FPS:" + std::to_string((int)fps),
                 cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.7,
@@ -771,9 +775,6 @@ int main()
     SetConsoleOutputCP(65001);
     SetConsoleCP(65001);
 
-    // 不再设定默认模型路径——用户必须在 UI 中选择模型后才能开始运行
-    g_modelPath[0] = '\0';
-
     int ret = kmNet_init(g_kmIP, g_kmPort, g_kmMAC);
     if (ret != 0) {
         printf("[KMBox] 连接失败(ret=%d)，降级 SendInput\n", ret);
@@ -787,11 +788,12 @@ int main()
         PushLog("[KMBox] 连接成功");
     }
 
-    // ── 键盘屏蔽默认值：有 KMBox 连接默认用 KMBox 屏蔽，否则用系统 Hook。
+    // ── 急停后端默认值：有 KMBox 连接默认 KMBox反向，否则系统反向。
     //    仅在启动时设定一次；用户之后可在 UI 自由切换，不会被覆盖。
-    g_kbdMaskMode = g_kmConnected ? MASK_KMBOX : MASK_HOOK;
-    PushLog(g_kmConnected ? "[屏蔽] 默认: KMBox屏蔽" : "[屏蔽] 默认: 系统Hook屏蔽");
+    g_csBackend = g_kmConnected ? CS_KMBOX : CS_SYSTEM;
+    PushLog(g_kmConnected ? "[急停] 默认: KMBox反向" : "[急停] 默认: 系统反向");
 
+    std::string path(g_modelPath);
     SetMoveMethod(g_kmConnected ? 0 : 1);
 
     g_capW.store(g_captureRadius * 2, std::memory_order_release);
@@ -804,13 +806,35 @@ int main()
         PushLog(buf);
     }
 
-    // 不在启动时自动加载模型——用户必须先在 UI 中选择模型路径，
-    // 然后点击"开始"才会加载并运行。避免模型路径无效时直接报错退出。
-    PushLog("[系统] 启动完成，请选择模型文件后点击[开始]");
+    // ── 启动时不强制加载模型 ────────────────────
+    //   模型路径默认为空，避免因路径无效而报错退出。
+    //   待用户在 UI 设置好路径并点击"开始"后，由主控线程重载引擎。
+    if (path.empty()) {
+        PushLog("[引擎] 未设置模型路径，启动后请在界面填写并点击开始");
+    }
+    else {
+        try {
+            g_detector = std::make_unique<Detector>(
+                path, model_way,
+                static_cast<InferenceEngine>(inference_engine_mode));
+            g_detector->SetInputSize(g_modelInputSize);
+            g_detector->SetONNXDevice(g_onnxDevice);
+            char buf[128];
+            snprintf(buf, sizeof(buf), "[引擎] 加载成功 %dx%d", g_modelInputSize, g_modelInputSize);
+            PushLog(buf);
+        }
+        catch (const std::exception& e) {
+            // 不再退出：仅记录失败，保持暂停，等待用户修正路径后重试。
+            char buf[256];
+            snprintf(buf, sizeof(buf), "[引擎] 加载失败: %s（保持暂停，请修正路径后点击开始）", e.what());
+            PushLog(buf);
+            fprintf(stderr, "%s\n", buf);
+            g_detector.reset();
+        }
+    }
 
     timeBeginPeriod(1);
     StartRawInput();
-    StartKbdHook();          // 低级键盘钩子（系统Hook屏蔽用，常驻）
     ImGuiUI::Get().Start();
 
     // CaptureLoop 和 DisplayLoop 是常驻线程；g_running=false 时它们 park 在安全点。
@@ -822,10 +846,15 @@ int main()
     g_capW.store(g_captureRadius * 2, std::memory_order_release);
     g_capH.store(g_captureRadius * 2, std::memory_order_release);
 
-    // ── 默认不自动运行，保持在暂停状态。用户选择模型后点击"开始"才会放行。
-    //    此时 g_running=false，两线程在 parked 安全点等待。
+    // ── 启动后自动放行一次，进入运行 ─────────────────────────────
+    // 让两线程从 parked→active；CaptureLoop 会在自己的线程内首次 Init DXGI。
+    // 启动时默认暂停：不自动放行，保持两线程 parked。
+    // 等用户设置好模型路径并点击"开始"，由主控循环 (C) 分支重载引擎后再放行。
+    g_running.store(false, std::memory_order_release);
     g_paused.store(true, std::memory_order_release);
-    PushLog("[系统] 就绪——请选择模型文件后点击[开始]");
+    g_capParked.store(true, std::memory_order_release);   // 标记已停在安全点
+    g_dispParked.store(true, std::memory_order_release);
+    PushLog("[系统] 已暂停（启动默认）。请设置模型路径后点击开始");
 
     // ════════════════════════════════════════════════════════════════
     //  主控循环：所有"会改变共享资源/尺寸/引擎"的操作都遵循同一铁律——
@@ -873,41 +902,51 @@ int main()
             continue;
         }
 
-        // ── (C) 开始/继续请求：全停 → 校验模型 → 重载引擎/KMBox → 放行 ──
+        // ── (C) 开始/继续请求：全停 → 重载引擎/KMBox → 放行 ──────────
         if (g_requestResume.exchange(false)) {
-            PushLog("[系统] 收到开始/继续，校验模型…");
-
-            // ★ 校验模型路径：未选择模型文件则拒绝运行，防止引擎加载失败导致崩溃
-            if (g_modelPath[0] == '\0') {
-                PushLog("[错误] 未选择模型文件！请先在[设备]页浏览选择模型，再点击开始");
-                continue;   // 保持暂停，不放行
-            }
-            if (GetFileAttributesA(g_modelPath) == INVALID_FILE_ATTRIBUTES) {
-                char buf[512];
-                snprintf(buf, sizeof(buf), "[错误] 模型文件不存在: %s", g_modelPath);
-                PushLog(buf);
-                continue;   // 保持暂停，不放行
-            }
+            PushLog("[系统] 收到开始/继续，重载配置…");
 
             StopAndWaitParked();                  // ★ 确定性全停
             if (g_requestQuit.load()) break;
 
+            // 路径为空：不放行，保持暂停，提示用户设置路径。
+            if (std::string(g_modelPath).empty()) {
+                PushLog("[引擎] 模型路径为空，无法开始。请先设置路径");
+                g_capParked.store(true, std::memory_order_release);
+                g_dispParked.store(true, std::memory_order_release);
+                g_paused.store(true, std::memory_order_release);
+                g_running.store(false, std::memory_order_release);
+                continue;
+            }
+
             // 重载推理引擎（两线程已 parked，g_detector 无人使用）
+            bool engineOk = false;
             try {
                 g_detector.reset();
                 g_detector = std::make_unique<Detector>(
                     std::string(g_modelPath), model_way,
                     static_cast<InferenceEngine>(inference_engine_mode));
                 g_detector->SetInputSize(g_modelInputSize);
+                g_detector->SetONNXDevice(g_onnxDevice);
+                engineOk = true;
                 char buf[128];
-                snprintf(buf, sizeof(buf), "[引擎] 加载成功 %dx%d", g_modelInputSize, g_modelInputSize);
+                snprintf(buf, sizeof(buf), "[引擎] 重载成功 %dx%d", g_modelInputSize, g_modelInputSize);
                 PushLog(buf);
             }
             catch (const std::exception& e) {
                 char buf[256];
-                snprintf(buf, sizeof(buf), "[引擎] 加载失败: %s", e.what());
+                snprintf(buf, sizeof(buf), "[引擎] 重载失败: %s", e.what());
                 PushLog(buf);
-                // 加载失败：保持暂停，不放行，避免无引擎空跑
+                g_detector.reset();
+            }
+
+            // 引擎加载失败：保持暂停，不放行，避免无检测器运行。
+            if (!engineOk) {
+                PushLog("[系统] 引擎未就绪，保持暂停。请修正路径后重试");
+                g_capParked.store(true, std::memory_order_release);
+                g_dispParked.store(true, std::memory_order_release);
+                g_paused.store(true, std::memory_order_release);
+                g_running.store(false, std::memory_order_release);
                 continue;
             }
 
@@ -945,9 +984,7 @@ int main()
     // ── 彻底退出：先全停，再 join ─────────────────────────────────
     g_running.store(false, std::memory_order_release);
     g_paused.store(true, std::memory_order_release);
-    ClearAllKeyMasks();      // 确保退出时不残留任何键盘屏蔽
     StopRawInput();
-    StopKbdHook();           // 卸载低级键盘钩子
     if (captureThread.joinable()) captureThread.join();
     if (displayThread.joinable()) displayThread.join();
     timeEndPeriod(1);

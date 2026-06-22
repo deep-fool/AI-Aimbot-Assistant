@@ -46,10 +46,19 @@ static inline void DoMouseLeft(int state) {
 }
 
 // ============================================================
-//  屏幕参数
+//  屏幕参数（默认从系统自动读取，CenterToScreen 可覆盖）
 // ============================================================
-static int CENTER_X = 1280;
-static int CENTER_Y = 800;
+static int CENTER_X = 0;  // 0=首次使用时自动读取系统分辨率
+static int CENTER_Y = 0;
+
+static int GetCenterX() {
+    if (CENTER_X <= 0) CENTER_X = GetSystemMetrics(SM_CXSCREEN) / 2;
+    return CENTER_X;
+}
+static int GetCenterY() {
+    if (CENTER_Y <= 0) CENTER_Y = GetSystemMetrics(SM_CYSCREEN) / 2;
+    return CENTER_Y;
+}
 
 void CenterToScreen(float x, float y) {
     CENTER_X = (int)x;
@@ -254,8 +263,8 @@ void SendData(int targetX, int targetY, bool isfire, float sendOffset, int /*box
     if (targetX < 100 || targetY < 100 || targetX > 3000 || targetY > 2000)
         return;
 
-    float raw_x = (float)(targetX - CENTER_X);
-    float raw_y = (float)(targetY - CENTER_Y);
+    float raw_x = (float)(targetX - GetCenterX());
+    float raw_y = (float)(targetY - GetCenterY());
     float dist = sqrtf(raw_x * raw_x + raw_y * raw_y);
 
     if (dist <= CFG_DZ_DIST) {

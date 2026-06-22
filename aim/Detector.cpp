@@ -1,9 +1,13 @@
-﻿#include "Detector.h"
+﻿#define NOMINMAX
+#include "Detector.h"
+#include <Windows.h>
 #include <fstream>
 #include <stdexcept>
 #include <numeric>
 #include <algorithm>
 #include <chrono>
+#include <thread>
+#include <cstring>
 
 // 记录单帧"纯推理"耗时（不含预处理/后处理），单位 ms
 static thread_local double g_lastPureInferMs = 0.0;
@@ -113,14 +117,81 @@ void Detector::InitONNXRuntime(const std::string& modelPath)
     Ort::SessionOptions sessionOptions;
     sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
-    // 尝试启用 CUDA EP，失败则回退到 CPU
-    try {
-        OrtCUDAProviderOptions cudaOpts{};
-        sessionOptions.AppendExecutionProvider_CUDA(cudaOpts);
-        printf("[DBG] ONNXRuntime: CUDA EP 已启用\n");
-    }
-    catch (const std::exception& e) {
-        printf("[DBG] ONNXRuntime: CUDA EP 启用失败 (%s)，使用 CPU\n", e.what());
+    // ===== DirectML / CUDA EP 动态加载 (优先 DirectML: NVIDIA/AMD/Intel 通用) =====
+    {
+        // 获取原始 C API 指针 (用于错误处理, Ort::GetApi() 在某些版本不可靠)
+        const OrtApi* api = OrtGetApiBase()->GetApi(1);  // API v1 所有版本兼容
+
+        HMODULE ortDll = GetModuleHandleA("onnxruntime.dll");
+        bool gpuOK = false;
+        const char* deviceName = "CPU";
+
+        if (ortDll) {
+            typedef OrtStatus* (ORT_API_CALL* EpAppendFn)(OrtSessionOptions*, int);
+
+            // 1) DirectML (优先 — 支持 NVIDIA/AMD/Intel 显卡)
+            //    m_onnxDevicePref: 0=Auto 1=DirectML 2=CUDA 3=CPU
+            if (m_onnxDevicePref == 0 || m_onnxDevicePref == 1) {
+                EpAppendFn epFn = (EpAppendFn)GetProcAddress(ortDll,
+                    "OrtSessionOptionsAppendExecutionProvider_DML");
+                if (!epFn) epFn = (EpAppendFn)GetProcAddress(ortDll,
+                    "OrtSessionOptionsAppendExecutionProvider_DML1");
+                if (epFn) {
+                    OrtStatus* st = epFn(sessionOptions, 0);
+                    if (!st) {
+                        gpuOK = true; deviceName = "DirectML";
+                        printf("[DBG] ONNXRuntime: DirectML EP loaded (NVIDIA/AMD/Intel)\n");
+                    }
+                    else {
+                        printf("[DBG] ONNXRuntime: DirectML failed: %s\n",
+                            api->GetErrorMessage(st));
+                        api->ReleaseStatus(st);
+                    }
+                }
+                else {
+                    printf("[DBG] ONNXRuntime: DirectML not in this onnxruntime build\n");
+                }
+            }
+
+            // 2) CUDA 回退 (仅 NVIDIA)
+            if (!gpuOK && (m_onnxDevicePref == 0 || m_onnxDevicePref == 2)) {
+                EpAppendFn epFn = (EpAppendFn)GetProcAddress(ortDll,
+                    "OrtSessionOptionsAppendExecutionProvider_CUDA");
+                if (!epFn) epFn = (EpAppendFn)GetProcAddress(ortDll,
+                    "OrtSessionOptionsAppendExecutionProvider_CUDA_V2");
+                if (epFn) {
+                    OrtStatus* st = epFn(sessionOptions, 0);
+                    if (!st) {
+                        gpuOK = true; deviceName = "CUDA";
+                        printf("[DBG] ONNXRuntime: CUDA EP loaded (NVIDIA)\n");
+                    }
+                    else {
+                        printf("[DBG] ONNXRuntime: CUDA failed: %s\n",
+                            api->GetErrorMessage(st));
+                        api->ReleaseStatus(st);
+                    }
+                }
+                else {
+                    printf("[DBG] ONNXRuntime: CUDA not available\n");
+                }
+            }
+        }
+
+        if (!gpuOK) {
+            printf("[DBG] ONNXRuntime: Using CPU inference\n");
+        }
+
+        // ===== 性能优化: 内存模式 + 线程配置 =====
+        sessionOptions.EnableMemPattern();
+        {
+            int nThreads = (int)std::thread::hardware_concurrency();
+            if (nThreads < 2) nThreads = 2;
+            if (nThreads > 8) nThreads = 8;
+            sessionOptions.SetIntraOpNumThreads(nThreads);
+            sessionOptions.SetInterOpNumThreads(2);
+            printf("[DBG] ONNXRuntime: device=%s threads=%d memPattern=ON\n",
+                deviceName, nThreads);
+        }
     }
 
 #ifdef _WIN32
@@ -170,6 +241,51 @@ void Detector::InitONNXRuntime(const std::string& modelPath)
         }
     }
     printf("[DBG] numClasses=%d  numAnchors=%d\n", numClasses, numAnchors_);
+
+    // ===== 快速路径初始化: 预分配缓冲 + 预创建Tensor + LUT + 预热 =====
+    BuildLUT();
+
+    // 预分配输入缓冲 (planar float: 3 * inputSize^2)
+    const size_t planeSize = (size_t)inputSize * inputSize;
+    m_onnxInputData.resize(3 * planeSize);
+
+    // 预构建输入 shape
+    m_onnxInputShape = { 1, 3, (int64_t)inputSize, (int64_t)inputSize };
+
+    // 预创建 Ort::Value 包装 m_onnxInputData (零拷贝 — 数据直接写入 tensor 内存)
+    m_onnxInputTensor = Ort::Value::CreateTensor<float>(
+        ortMemInfo,
+        m_onnxInputData.data(),
+        m_onnxInputData.size(),
+        m_onnxInputShape.data(),
+        m_onnxInputShape.size());
+
+    // 预创建 RunOptions (每帧复用, 避免堆分配)
+    m_onnxRunOptions = Ort::RunOptions{};
+
+    // 缓存 name 指针 (避免每帧 c_str() 调用)
+    m_pInputName = ortInputName.c_str();
+    m_pOutputName = ortOutputName.c_str();
+
+    // 模型预热: 首帧推理包含 kernel 编译/内存分配, 提前跑一次空帧
+    printf("[DBG] ONNXRuntime: warming up (first inference always slow)...\n");
+    {
+        std::fill(m_onnxInputData.begin(), m_onnxInputData.end(), 0.0f);
+        const auto warm0 = std::chrono::high_resolution_clock::now();
+        try {
+            std::vector<Ort::Value> warmOutput;
+            warmOutput = ortSession.Run(m_onnxRunOptions,
+                &m_pInputName, &m_onnxInputTensor, 1,
+                &m_pOutputName, 1);
+        }
+        catch (const Ort::Exception&) {
+            // 预热失败非致命 — 首帧真实推理时完成 kernel 编译
+            printf("[DBG] ONNXRuntime: warmup failed (non-fatal)\n");
+        }
+        const auto warm1 = std::chrono::high_resolution_clock::now();
+        double warmMs = std::chrono::duration<double, std::milli>(warm1 - warm0).count();
+        printf("[DBG] ONNXRuntime: warmup %.1f ms\n", warmMs);
+    }
 }
 
 // =============================================================
@@ -182,10 +298,34 @@ void Detector::SetInputSize(int size)
     if (buffersAllocated)
         FreeBuffers();
     inputSize = size;
-    if (inference_engine == InferenceEngine::TensorRT)
+
+    // 公共: 分配 FastPreprocess 用的 CPU 缓冲 + 初始化 LUT (TensorRT & ONNX 都需要)
+    static bool s_lutBuilt = false;
+    if (!s_lutBuilt) { BuildLUT(); s_lutBuilt = true; }
+
+    const size_t planeFloats = (size_t)inputSize * inputSize;
+    m_onnxInputData.clear();
+    m_onnxInputData.resize(3 * planeFloats);
+    m_lastSrcW = 0;
+    m_lastSrcH = 0;
+
+    if (inference_engine == InferenceEngine::TensorRT) {
         AllocateBuffers();
-    else
-        buffersAllocated = true; // ONNXRuntime 不需要预分配 GPU buffer
+    }
+    else {
+        // ONNX 特有: 预创建 tensor + RunOptions
+        m_onnxInputShape = { 1, 3, (int64_t)inputSize, (int64_t)inputSize };
+
+        m_onnxInputTensor = Ort::Value{ nullptr };
+        m_onnxInputTensor = Ort::Value::CreateTensor<float>(
+            ortMemInfo,
+            m_onnxInputData.data(),
+            m_onnxInputData.size(),
+            m_onnxInputShape.data(),
+            m_onnxInputShape.size());
+
+        buffersAllocated = true;
+    }
 }
 
 // =============================================================
@@ -193,31 +333,50 @@ void Detector::SetInputSize(int size)
 // =============================================================
 void Detector::AllocateBuffers()
 {
-    cudaMalloc(&buffers[0],
-        static_cast<size_t>(1) * 3 * inputSize * inputSize * sizeof(float));
+    const size_t inFloats = static_cast<size_t>(3) * inputSize * inputSize;
+    cudaMalloc(&buffers[0], inFloats * sizeof(float));
 
+    size_t outFloats;
     if (model_way == 0) {
         // YOLOv10: 输出 [1, 300, 6]，固定 300 个候选框
-        cudaMalloc(&buffers[1],
-            static_cast<size_t>(1) * 300 * 6 * sizeof(float));
+        outFloats = static_cast<size_t>(300) * 6;
+        cudaMalloc(&buffers[1], outFloats * sizeof(float));
         printf("[DBG] AllocateBuffers(v10): inputSize=%d  boxes=300 stride=6\n", inputSize);
     }
     else {
         // YOLOv11: 按实际 anchor 数分配
         const int rowDim = 4 + numClasses;
-        cudaMalloc(&buffers[1],
-            static_cast<size_t>(1) * rowDim * numAnchors_ * sizeof(float));
+        outFloats = static_cast<size_t>(rowDim) * numAnchors_;
+        cudaMalloc(&buffers[1], outFloats * sizeof(float));
         printf("[DBG] AllocateBuffers(v11): inputSize=%d  rowDim=%d  numAnchors=%d\n",
             inputSize, rowDim, numAnchors_);
     }
+
+    // ── 页锁(pinned)主机缓冲：让 H2D / D2H 走真正的异步 DMA，而非 pageable 慢路径 ──
+    //   这是 TensorRT 比 DML 慢的主因：原先用 std::vector(可分页内存)做 cudaMemcpyAsync，
+    //   驱动会退化为同步暂存拷贝，并且每帧还重新分配/清零输出 vector。
+    if (m_trtHostIn) { cudaFreeHost(m_trtHostIn); m_trtHostIn = nullptr; }
+    if (m_trtHostOut) { cudaFreeHost(m_trtHostOut); m_trtHostOut = nullptr; }
+    cudaHostAlloc((void**)&m_trtHostIn, inFloats * sizeof(float), cudaHostAllocDefault);
+    cudaHostAlloc((void**)&m_trtHostOut, outFloats * sizeof(float), cudaHostAllocDefault);
+    m_trtHostInFloats = inFloats;
+    m_trtHostOutFloats = outFloats;
+
     buffersAllocated = true;
 }
 
 void Detector::FreeBuffers()
 {
     if (inference_engine == InferenceEngine::TensorRT) {
+        // graph 捕获了固定的 buffer/host 地址，释放前必须先销毁，否则下次重建地址变了会出错
+        DestroyTRTGraph();
+        m_graphDisabled = false;  // 重新分配后允许再次尝试录制
         if (buffers[0]) { cudaFree(buffers[0]); buffers[0] = nullptr; }
         if (buffers[1]) { cudaFree(buffers[1]); buffers[1] = nullptr; }
+        if (m_trtHostIn) { cudaFreeHost(m_trtHostIn); m_trtHostIn = nullptr; }
+        if (m_trtHostOut) { cudaFreeHost(m_trtHostOut); m_trtHostOut = nullptr; }
+        m_trtHostInFloats = 0;
+        m_trtHostOutFloats = 0;
     }
     buffersAllocated = false;
 }
@@ -297,6 +456,117 @@ std::vector<Detection> Detector::Inference(const cv::Mat& frame)
     }
 
     return result;
+}
+
+// =============================================================
+// BuildLUT: 一次性初始化 1/255 归一化查找表
+// =============================================================
+void Detector::BuildLUT()
+{
+    for (int i = 0; i < 256; i++)
+        m_lut[i] = static_cast<float>(i) / 255.0f;
+}
+
+// =============================================================
+// FastPreprocess: 手写 LetterBox 预处理 (替代 OpenCV 全链路)
+//   一次遍历完成: 缩放 + BGR→RGB + 归一化 + HWC→CHW
+//   直接写入 m_onnxInputData (m_onnxInputTensor 零拷贝包装此缓冲)
+// =============================================================
+void Detector::FastPreprocess(const cv::Mat& frame)
+{
+    const int srcW = frame.cols;
+    const int srcH = frame.rows;
+    const int dstW = inputSize;
+    const int dstH = inputSize;
+
+    // ── 1. 计算 LetterBox 参数 ────────────────────────────────
+    m_scale = std::min(static_cast<float>(dstW) / srcW,
+        static_cast<float>(dstH) / srcH);
+    m_newW = static_cast<int>(srcW * m_scale);
+    m_newH = static_cast<int>(srcH * m_scale);
+    m_padX = (dstW - m_newW) / 2;
+    m_padY = (dstH - m_newH) / 2;
+
+    // ── 2. 平面指针 ─────────────────────────────────────────
+    const size_t planeSize = (size_t)dstW * dstH;
+    float* rPlane = m_onnxInputData.data();
+    float* gPlane = m_onnxInputData.data() + planeSize;
+    float* bPlane = m_onnxInputData.data() + planeSize * 2;
+
+    // ── 3. 灰度填充 (LetterBox 背景 114/255) ────────────────
+    const float gray = m_lut[114];
+    if (m_padX > 0 || m_padY > 0 || m_newW < dstW || m_newH < dstH) {
+        std::fill(rPlane, rPlane + planeSize, gray);
+        std::fill(gPlane, gPlane + planeSize, gray);
+        std::fill(bPlane, bPlane + planeSize, gray);
+    }
+
+    if (m_newW <= 0 || m_newH <= 0) return;
+
+    // ── 4. 懒重建内容映射表 (源帧尺寸变化时) ────────────────
+    if (srcW != m_lastSrcW || srcH != m_lastSrcH) {
+        m_lastSrcW = srcW;
+        m_lastSrcH = srcH;
+
+        m_contentMapX.resize(m_newW);
+        m_contentMapY.resize(m_newH);
+
+        const float invScale = 1.0f / m_scale;
+        for (int c = 0; c < m_newW; c++) {
+            int sx = static_cast<int>(c * invScale);
+            m_contentMapX[c] = (sx < srcW) ? sx : (srcW - 1);
+        }
+        for (int r = 0; r < m_newH; r++) {
+            int sy = static_cast<int>(r * invScale);
+            m_contentMapY[r] = (sy < srcH) ? sy : (srcH - 1);
+        }
+    }
+
+    const int* mapX = m_contentMapX.data();
+    const int* mapY = m_contentMapY.data();
+    const uint8_t* srcData = frame.data;
+    const int srcStep = static_cast<int>(frame.step);
+    const int srcCh = frame.channels();  // 3 for BGR
+
+    // ── 5. 内容区域填充: BGR→Planar RGB + LUT归一化 ────────
+    //    4像素展开循环 (参考 others/detector.h 优化)
+    for (int r = 0; r < m_newH; r++) {
+        const int srcY = mapY[r];
+        const uint8_t* srcRow = srcData + srcY * srcStep;
+        const int dstRowBase = (m_padY + r) * dstW + m_padX;
+
+        int c = 0;
+        const int newW4 = m_newW - 3;
+        for (; c < newW4; c += 4) {
+            const uint8_t* p0 = srcRow + mapX[c] * srcCh;
+            const uint8_t* p1 = srcRow + mapX[c + 1] * srcCh;
+            const uint8_t* p2 = srcRow + mapX[c + 2] * srcCh;
+            const uint8_t* p3 = srcRow + mapX[c + 3] * srcCh;
+
+            const int di = dstRowBase + c;
+            // OpenCV Mat 默认 BGR: p[0]=B, p[1]=G, p[2]=R
+            rPlane[di] = m_lut[p0[2]];
+            gPlane[di] = m_lut[p0[1]];
+            bPlane[di] = m_lut[p0[0]];
+            rPlane[di + 1] = m_lut[p1[2]];
+            gPlane[di + 1] = m_lut[p1[1]];
+            bPlane[di + 1] = m_lut[p1[0]];
+            rPlane[di + 2] = m_lut[p2[2]];
+            gPlane[di + 2] = m_lut[p2[1]];
+            bPlane[di + 2] = m_lut[p2[0]];
+            rPlane[di + 3] = m_lut[p3[2]];
+            gPlane[di + 3] = m_lut[p3[1]];
+            bPlane[di + 3] = m_lut[p3[0]];
+        }
+        // 尾部 1-3 列
+        for (; c < m_newW; c++) {
+            const uint8_t* p = srcRow + mapX[c] * srcCh;
+            const int di = dstRowBase + c;
+            rPlane[di] = m_lut[p[2]];
+            gPlane[di] = m_lut[p[1]];
+            bPlane[di] = m_lut[p[0]];
+        }
+    }
 }
 
 // =============================================================
@@ -408,85 +678,54 @@ std::vector<Detection> Detector::InferenceTensorRT(const cv::Mat& frame)
 {
     std::vector<Detection> results;
 
-    // ── A. LetterBox ─────────────────────────────────────────
+    // ── A. 快速预处理 (手写, 与 ONNX 路径共用 FastPreprocess) ──
+    FastPreprocess(frame);
+
     const int originalW = frame.cols;
     const int originalH = frame.rows;
-    const float scale = std::min(
-        (float)inputSize / originalW,
-        (float)inputSize / originalH);
-    const int newW = (int)(originalW * scale);
-    const int newH = (int)(originalH * scale);
 
-    cv::Mat resized;
-    cv::resize(frame, resized, cv::Size(newW, newH));
+    // ── B. planar float → 页锁输入缓冲 (CPU→CPU，graph 内做 H2D) ──
+    const size_t inFloats = (size_t)3 * inputSize * inputSize;
+    const size_t inBytes = inFloats * sizeof(float);
+    std::memcpy(m_trtHostIn, m_onnxInputData.data(), inBytes);
 
-    cv::Mat input(inputSize, inputSize, CV_8UC3, cv::Scalar(114, 114, 114));
-    const int padX = (inputSize - newW) / 2;
-    const int padY = (inputSize - newH) / 2;
-    resized.copyTo(input(cv::Rect(padX, padY, newW, newH)));
-    cv::cvtColor(input, input, cv::COLOR_BGR2RGB);
+    // ── 输出元素数（按 model_way 确定）──────────────────────────
+    const int    rowDim = (model_way == 0) ? 6 : (4 + numClasses);
+    const int    anchors = (model_way == 0) ? 300 : numAnchors_;
+    const size_t outFloats = (size_t)rowDim * anchors;
 
-    // ── B. 归一化 ─────────────────────────────────────────────
-    cv::Mat inputF;
-    input.convertTo(inputF, CV_32FC3, 1.0 / 255.0);
-
-    // ── C. HWC -> CHW ─────────────────────────────────────────
-    std::vector<cv::Mat> channels(3);
-    cv::split(inputF, channels);
-    float* gpu_input = (float*)buffers[0];
-    const size_t channelBytes = (size_t)inputSize * inputSize * sizeof(float);
-    for (int i = 0; i < 3; i++)
-        cudaMemcpyAsync(gpu_input + i * inputSize * inputSize,
-            channels[i].data, channelBytes,
-            cudaMemcpyHostToDevice, stream);
-
-    // ── D. 推理 ───────────────────────────────────────────────
+    // 固定张量地址（graph 录制 / 普通路径都需要，且必须在 capture 前设好）
     context->setTensorAddress("images", buffers[0]);
     context->setTensorAddress("output0", buffers[1]);
 
     const auto tInfer0 = std::chrono::high_resolution_clock::now();
-    bool ok = context->enqueueV3(stream);
-    if (!ok) {
-        printf("[DBG] enqueueV3 返回 false！推理失败\n");
-        return results;
+
+    // ── C. 优先走 CUDA Graph：把 H2D→enqueue→D2H 三步合成一次提交 ──
+    //   小负载下，多次 cudaMemcpyAsync/enqueueV3 的 CPU 端 launch 开销
+    //   是 TRT 单帧延迟高于 DML 的主因；graph 把这些 launch 折叠成一次。
+    if (!m_graphReady && !m_graphDisabled) {
+        CaptureTRTGraph(outFloats);  // 首次：录制+实例化（内部已含一次真实执行）
     }
 
-    // ── E. GPU -> CPU & 后处理（按 model_way 分支） ─────────────
-    if (model_way == 0)
-    {
-        // =========================================================
-        // YOLOv10: 输出 [1, 300, 6] = [x1,y1,x2,y2,score,class]
-        // 坐标为 letterbox 空间内的绝对像素坐标
-        // =========================================================
-        const int numBoxes = 300;
-        const int stride = 6;
-        std::vector<float> output((size_t)numBoxes * stride);
-
-        cudaMemcpyAsync(output.data(), buffers[1],
-            output.size() * sizeof(float),
-            cudaMemcpyDeviceToHost, stream);
-        cudaError_t err = cudaStreamSynchronize(stream);
-        {
-            const auto tInfer1 = std::chrono::high_resolution_clock::now();
-            g_lastPureInferMs = std::chrono::duration<double, std::milli>(tInfer1 - tInfer0).count();
-        }
-        if (err != cudaSuccess) {
-            printf("[DBG] cudaStreamSynchronize 失败: %s\n", cudaGetErrorString(err));
+    cudaError_t err = cudaSuccess;
+    if (m_graphReady && m_graphOutFloats == outFloats) {
+        // 已录制：仅启动图 + 一次同步
+        cudaGraphLaunch(m_graphExec, stream);
+        err = cudaStreamSynchronize(stream);
+    }
+    else {
+        // 回退：原始三步序列（graph 不可用时）
+        float* gpu_input = (float*)buffers[0];
+        cudaMemcpyAsync(gpu_input, m_trtHostIn, inBytes, cudaMemcpyHostToDevice, stream);
+        if (!context->enqueueV3(stream)) {
+            printf("[DBG] enqueueV3 返回 false！推理失败\n");
             return results;
         }
-
-        return PostProcessV10(output.data(), numBoxes, stride, originalW, originalH, scale, padX, padY);
+        cudaMemcpyAsync(m_trtHostOut, buffers[1], outFloats * sizeof(float),
+            cudaMemcpyDeviceToHost, stream);
+        err = cudaStreamSynchronize(stream);
     }
 
-    // =========================================================
-    // YOLOv11: 输出 [1, 4+nc, anchors]
-    // =========================================================
-    const int rowDim = 4 + numClasses;
-    std::vector<float> output((size_t)rowDim * numAnchors_);
-    cudaMemcpyAsync(output.data(), buffers[1],
-        output.size() * sizeof(float),
-        cudaMemcpyDeviceToHost, stream);
-    cudaError_t err = cudaStreamSynchronize(stream);
     {
         const auto tInfer1 = std::chrono::high_resolution_clock::now();
         g_lastPureInferMs = std::chrono::duration<double, std::milli>(tInfer1 - tInfer0).count();
@@ -496,92 +735,140 @@ std::vector<Detection> Detector::InferenceTensorRT(const cv::Mat& frame)
         return results;
     }
 
-    // ── F. 原始输出统计（只在首帧打印，确认数值范围）────────────
+    float* output = m_trtHostOut;
+
+    // ── D. 后处理（按 model_way 分支）─────────────────────────────
+    if (model_way == 0)
+    {
+        // YOLOv10: 输出 [1, 300, 6] = [x1,y1,x2,y2,score,class]
+        return PostProcessV10(output, anchors, rowDim, originalW, originalH, m_scale, m_padX, m_padY);
+    }
+
+    // ── 原始输出统计（只在首帧打印，确认数值范围）────────────
     static bool s_firstFrame = true;
     if (s_firstFrame) {
         s_firstFrame = false;
         float minV = output[0], maxV = output[0], sumV = 0.f;
         int   nanCnt = 0;
-        for (float v : output) {
+        for (size_t i = 0; i < outFloats; i++) {
+            float v = output[i];
             if (!std::isfinite(v)) { nanCnt++; continue; }
             minV = std::min(minV, v); maxV = std::max(maxV, v); sumV += v;
         }
         printf("[DBG] output raw  min=%.4f  max=%.4f  mean=%.4f  nan/inf=%d  total=%zu\n",
-            minV, maxV, sumV / output.size(), nanCnt, output.size());
+            minV, maxV, sumV / (float)outFloats, nanCnt, outFloats);
 
         float maxConf = -1.f;
         for (int c = 0; c < numClasses; c++) {
-            const float* row = output.data() + (4 + c) * numAnchors_;
+            const float* row = output + (4 + c) * numAnchors_;
             for (int i = 0; i < numAnchors_; i++)
                 maxConf = std::max(maxConf, row[i]);
         }
         printf("[DBG] max conf across all anchors/classes = %.4f  (threshold=0.25)\n", maxConf);
 
         float maxCx = -1.f;
-        const float* rowCx = output.data() + 0 * numAnchors_;
+        const float* rowCx = output + 0 * numAnchors_;
         for (int i = 0; i < numAnchors_; i++)
             maxCx = std::max(maxCx, rowCx[i]);
         printf("[DBG] max cx = %.2f  (should be ~0..%d)\n", maxCx, inputSize);
     }
 
-    return PostProcessV11(output.data(), rowDim, numAnchors_, originalW, originalH, scale, padX, padY);
+    return PostProcessV11(output, rowDim, numAnchors_, originalW, originalH, m_scale, m_padX, m_padY);
 }
 
 // =============================================================
-// ONNXRuntime 推理路径
+// CaptureTRTGraph: 录制 H2D→enqueueV3→D2H 为 CUDA Graph
+// =============================================================
+void Detector::CaptureTRTGraph(size_t outFloats)
+{
+    float* gpu_input = (float*)buffers[0];
+    const size_t inBytes = (size_t)3 * inputSize * inputSize * sizeof(float);
+
+    // ── 1. 先做一次"热身"真实执行：完成 TRT 可能的惰性初始化/选 kernel，
+    //       否则首次 capture 可能把一次性初始化也录进图里或导致 capture 失败。
+    cudaMemcpyAsync(gpu_input, m_trtHostIn, inBytes, cudaMemcpyHostToDevice, stream);
+    if (!context->enqueueV3(stream)) {
+        printf("[Graph] 热身 enqueueV3 失败，禁用 graph，回退普通路径\n");
+        m_graphDisabled = true;
+        return;
+    }
+    cudaMemcpyAsync(m_trtHostOut, buffers[1], outFloats * sizeof(float),
+        cudaMemcpyDeviceToHost, stream);
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        printf("[Graph] 热身同步失败，禁用 graph\n");
+        m_graphDisabled = true;
+        return;
+    }
+
+    // ── 2. 录制 ─────────────────────────────────────────────────
+    cudaError_t e = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+    if (e != cudaSuccess) {
+        printf("[Graph] BeginCapture 失败: %s，禁用 graph\n", cudaGetErrorString(e));
+        m_graphDisabled = true;
+        return;
+    }
+    cudaMemcpyAsync(gpu_input, m_trtHostIn, inBytes, cudaMemcpyHostToDevice, stream);
+    bool enqOk = context->enqueueV3(stream);
+    cudaMemcpyAsync(m_trtHostOut, buffers[1], outFloats * sizeof(float),
+        cudaMemcpyDeviceToHost, stream);
+
+    cudaGraph_t graph = nullptr;
+    cudaError_t endE = cudaStreamEndCapture(stream, &graph);
+
+    if (!enqOk || endE != cudaSuccess || graph == nullptr) {
+        printf("[Graph] 录制失败(enq=%d, end=%s)，禁用 graph，回退普通路径\n",
+            (int)enqOk, cudaGetErrorString(endE));
+        if (graph) cudaGraphDestroy(graph);
+        m_graphDisabled = true;
+        return;
+    }
+
+    // ── 3. 实例化 ───────────────────────────────────────────────
+    cudaGraphExec_t exec = nullptr;
+    cudaError_t instE = cudaGraphInstantiate(&exec, graph, 0);
+    if (instE != cudaSuccess || exec == nullptr) {
+        printf("[Graph] Instantiate 失败: %s，禁用 graph\n", cudaGetErrorString(instE));
+        cudaGraphDestroy(graph);
+        m_graphDisabled = true;
+        return;
+    }
+
+    m_graph = graph;
+    m_graphExec = exec;
+    m_graphOutFloats = outFloats;
+    m_graphReady = true;
+    printf("[Graph] CUDA Graph 录制成功，后续帧走 graph launch（outFloats=%zu）\n", outFloats);
+}
+
+void Detector::DestroyTRTGraph()
+{
+    if (m_graphExec) { cudaGraphExecDestroy(m_graphExec); m_graphExec = nullptr; }
+    if (m_graph) { cudaGraphDestroy(m_graph); m_graph = nullptr; }
+    m_graphReady = false;
+    m_graphOutFloats = 0;
+}
+
+// =============================================================
+// ONNXRuntime 推理路径 (快速版: 预分配缓冲 + 手写预处理 + 零拷贝Tensor复用)
 // =============================================================
 std::vector<Detection> Detector::InferenceONNXRuntime(const cv::Mat& frame)
 {
     std::vector<Detection> results;
 
-    // ── A. LetterBox ─────────────────────────────────────────
+    // ── A. 快速预处理 (手写, 直接写入 m_onnxInputData) ──────
+    FastPreprocess(frame);
+
     const int originalW = frame.cols;
     const int originalH = frame.rows;
-    const float scale = std::min(
-        (float)inputSize / originalW,
-        (float)inputSize / originalH);
-    const int newW = (int)(originalW * scale);
-    const int newH = (int)(originalH * scale);
 
-    cv::Mat resized;
-    cv::resize(frame, resized, cv::Size(newW, newH));
-
-    cv::Mat input(inputSize, inputSize, CV_8UC3, cv::Scalar(114, 114, 114));
-    const int padX = (inputSize - newW) / 2;
-    const int padY = (inputSize - newH) / 2;
-    resized.copyTo(input(cv::Rect(padX, padY, newW, newH)));
-    cv::cvtColor(input, input, cv::COLOR_BGR2RGB);
-
-    // ── B. 归一化 ─────────────────────────────────────────────
-    cv::Mat inputF;
-    input.convertTo(inputF, CV_32FC3, 1.0 / 255.0);
-
-    // ── C. HWC -> CHW ─────────────────────────────────────────
-    std::vector<cv::Mat> channels(3);
-    cv::split(inputF, channels);
-
-    std::vector<float> inputTensorValues((size_t)3 * inputSize * inputSize);
-    const size_t planeSize = (size_t)inputSize * inputSize;
-    for (int c = 0; c < 3; c++)
-        std::memcpy(inputTensorValues.data() + c * planeSize,
-            channels[c].data, planeSize * sizeof(float));
-
-    // ── D. 构造输入 Tensor 并推理 ────────────────────────────
-    std::array<int64_t, 4> inputShape = { 1, 3, inputSize, inputSize };
-
-    Ort::Value inputTensor = Ort::Value::CreateTensor<float>(
-        ortMemInfo, inputTensorValues.data(), inputTensorValues.size(),
-        inputShape.data(), inputShape.size());
-
-    const char* inputNames[] = { ortInputName.c_str() };
-    const char* outputNames[] = { ortOutputName.c_str() };
-
+    // ── B. 推理 (复用预创建的 tensor 和 RunOptions) ────────
     std::vector<Ort::Value> outputTensors;
     const auto tInfer0 = std::chrono::high_resolution_clock::now();
     try {
-        outputTensors = ortSession.Run(Ort::RunOptions{ nullptr },
-            inputNames, &inputTensor, 1,
-            outputNames, 1);
+        outputTensors = ortSession.Run(
+            m_onnxRunOptions,
+            &m_pInputName, &m_onnxInputTensor, 1,
+            &m_pOutputName, 1);
     }
     catch (const Ort::Exception& e) {
         printf("[DBG] ONNXRuntime Run 失败: %s\n", e.what());
@@ -594,25 +881,20 @@ std::vector<Detection> Detector::InferenceONNXRuntime(const cv::Mat& frame)
 
     const float* output = outputTensors[0].GetTensorData<float>();
     auto outShape = outputTensors[0].GetTensorTypeAndShapeInfo().GetShape();
-    // outShape: [1, d1, d2]
 
     if (outShape.size() != 3) return results;
     int d1 = (int)outShape[1];
     int d2 = (int)outShape[2];
 
-    // ── E. 后处理（按 model_way 分支）────────────────────────
+    // ── C. 后处理 (使用 FastPreprocess 计算好的 letterbox 参数) ──
     if (model_way == 0)
     {
         // YOLOv10: [1, num_boxes, 6]
-        int numBoxes = d1;
-        int stride = d2; // 应为 6
-        return PostProcessV10(output, numBoxes, stride, originalW, originalH, scale, padX, padY);
+        return PostProcessV10(output, d1, d2, originalW, originalH, m_scale, m_padX, m_padY);
     }
     else
     {
         // YOLOv11: [1, 4+nc, anchors]
-        int rowDim = d1;
-        int anchors = d2;
-        return PostProcessV11(output, rowDim, anchors, originalW, originalH, scale, padX, padY);
+        return PostProcessV11(output, d1, d2, originalW, originalH, m_scale, m_padX, m_padY);
     }
 }
